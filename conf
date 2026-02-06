@@ -1,0 +1,147 @@
+What we tested (E2E)
+Goal
+
+Validate that Bedrock AgentCore Tools & Gateways (MCP Gateway) can:
+
+expose a “tool” via a target (Lambda), and
+
+allow a client (Jupyter notebook) to discover and invoke that tool through the gateway.
+
+Components we set up
+
+MCP Gateway (AgentCore “Tools & Gateways”)
+
+Target = AWS Lambda (RefundToolEcho)
+
+Inline tool schema (defines the tool interface, name + required inputs)
+
+Client = Jupyter notebook calling the Gateway MCP endpoint using JSON-RPC:
+
+tools/list (discover tools)
+
+tools/call (invoke tool)
+
+Tool definition (schema)
+
+We defined a tool conceptually called process_refund with required fields:
+
+amount (integer)
+
+reason (string)
+
+Important nuance: when the gateway returns the tool list, it may return a gateway-prefixed tool name, e.g.:
+target-quick-start-6bd74e__process_refund
+That is the name you must use in tools/call.
+
+Steps we executed
+1) Tool discovery test (tools/list)
+
+From the notebook, we called:
+
+method: tools/list
+
+result: HTTP 200 with a tools array containing:
+
+tool name (prefixed by gateway)
+
+inputSchema showing amount and reason required
+
+✅ What this proves
+
+Gateway endpoint is reachable
+
+Gateway ↔ Lambda target wiring works for “tool discovery”
+
+Schema is being surfaced correctly through the MCP interface
+
+2) Tool invocation test (tools/call)
+
+From the notebook, we called:
+
+method: tools/call
+
+params: { "name": "<tool_name_from_list>", "arguments": {"amount": 25, "reason":"damaged item"} }
+
+result: HTTP 200, "isError": false, content returned:
+
+"status": "OK", "message": "Refund processed"
+
+✅ What this proves
+
+The MCP Gateway successfully routed an invocation to the Lambda target
+
+The Lambda correctly parsed MCP JSON-RPC parameters and returned an MCP-style response
+
+End-to-end tool execution works via AgentCore Gateway (discover → invoke)
+
+How this proves “AgentCore capability” (without runtime agents)
+
+Even though we didn’t create a runtime Agent, we validated the core building block that agents rely on:
+
+What AgentCore provides here
+
+A standard tool protocol (MCP) for tool discovery/invocation
+
+A Gateway layer that:
+
+exposes tools consistently (tools/list)
+
+invokes tools consistently (tools/call)
+
+is designed to support identity + policy enforcement in front of tool execution
+
+In other words:
+✅ we proved “tooling infrastructure works” — which is a prerequisite for runtime agents to safely call tools.
+
+What we did NOT test yet
+
+Inbound identity enforcement (client ID/secret, Cognito, etc.)
+
+Policy enforcement blocking/allowing tool calls
+
+Runtime agent orchestration / model-driven tool selection
+
+Next steps: Add policy enforcement (the “real” control test)
+Objective
+
+Demonstrate that the Gateway enforces authorization rules on tool invocation.
+
+Simple policy test
+
+Create a policy such as:
+
+Permit process_refund only if amount <= 1000
+
+Deny otherwise
+
+Execution plan (what to run)
+
+You’ll run the same notebook flow, but with 2 calls:
+
+A) Expected PASS
+
+amount=25 → should succeed
+
+B) Expected DENY
+
+amount=5000 → should fail with a policy denial / evaluation error
+
+✅ What this will prove
+
+Policies are actually evaluated at the gateway boundary (not in your Lambda code)
+
+Tool calls can be centrally controlled (governance) without modifying the tool implementation
+
+This is the security/governance value of AgentCore Identity + Policy Engine
+
+Suggested “definition of done” for the policy test
+
+You can say the policy enforcement test is complete when:
+
+tools/list still works (or behaves as expected under your policy model)
+
+tools/call with amount=25 succeeds
+
+tools/call with amount=5000 fails before tool execution (policy denies)
+
+CloudWatch logs show the Lambda was invoked only for the allowed request (optional but strong evidence)
