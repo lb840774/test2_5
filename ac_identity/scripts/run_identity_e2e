@@ -1,0 +1,59 @@
+import os, json
+from dotenv import load_dotenv
+import requests
+import boto3
+
+load_dotenv()
+
+RUNTIME_INVOKE_URL = os.getenv("RUNTIME_INVOKE_URL")
+if not RUNTIME_INVOKE_URL:
+    raise SystemExit("RUNTIME_INVOKE_URL is required")
+
+region = os.getenv("COGNITO_REGION", "us-east-1")
+client_id = os.getenv("COGNITO_CLIENT_ID")
+username = os.getenv("COGNITO_USERNAME")
+password = os.getenv("COGNITO_PASSWORD")
+
+if not all([client_id, username, password]):
+    raise SystemExit("Missing Cognito env vars")
+
+def get_valid_token():
+    c = boto3.client("cognito-idp", region_name=region)
+    r = c.initiate_auth(
+        ClientId=client_id,
+        AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": username, "PASSWORD": password},
+    )
+    return r["AuthenticationResult"]["AccessToken"]
+
+def call(token=None):
+    headers = {"Content-Type":"application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    payload = {"input":{"text":"identity e2e probe"}}
+    resp = requests.post(RUNTIME_INVOKE_URL, headers=headers, data=json.dumps(payload), timeout=45)
+    return resp.status_code, resp.text[:500]
+
+def denied(code, body):
+    return code in (401,403) or any(k in body.lower() for k in ["unauthorized","forbidden","invalid token","not authorized"])
+
+valid = get_valid_token()
+bad = "eyJ.invalid.token"
+
+c1,b1 = call(None)
+c2,b2 = call(bad)
+c3,b3 = call(valid)
+
+report = {
+    "no_token_denied": denied(c1,b1),
+    "bad_token_denied": denied(c2,b2),
+    "valid_token_allowed": (200 <= c3 < 300),
+    "details": {
+        "no_token": {"code": c1, "body": b1},
+        "bad_token": {"code": c2, "body": b2},
+        "valid": {"code": c3, "body": b3},
+    }
+}
+print(json.dumps(report, indent=2))
+if not all([report["no_token_denied"], report["bad_token_denied"], report["valid_token_allowed"]]):
+    raise SystemExit("E2E identity checks failed")
