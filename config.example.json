@@ -15,6 +15,13 @@
   "runtime_code_s3_prefix": "agentcore/runtime-artifacts/policy-agent",
   "runtime_name_prefix": "policy-agent-runtime",
   "runtime_endpoint_name": "policy-agent-endpoint",
-  "runtime_network_mode": "PUBLIC"
+  "runtime_network_mode": "PUBLIC",
+  "runtime_identity_mode": "JWT",
+  "jwt_discovery_url": "https://cognito-idp.<region>.amazonaws.com/<userPoolId>/.well-known/openid-configuration",
+  "jwt_allowed_audiences": ["<COGNITO_APP_CLIENT_ID>"],
+  "runtime_session_id": "identity-e2e-session-1"
+  
 }
+
+
 
