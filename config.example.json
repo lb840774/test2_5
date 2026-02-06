@@ -1,14 +1,10 @@
 {
   "region": "us-east-1",
-
-  "refund_limit": 1000,
-
+  "gateway_service_role_arn": "arn:aws:iam::<acct-id>:role/SandboxServiceRole",
+  "existing_lambda_arn": "arn:aws:lambda:us-east-1:<acct-id>:function:RefundToolEcho",
   "gateway_name_prefix": "policy-gateway",
   "target_name": "RefundTarget",
   "tool_name": "process_refund",
-
-  "existing_lambda_arn": "arn:aws:lambda:us-east-1:<acct-id>:function:RefundToolEcho",
-
-  "gateway_service_role_arn": "arn:aws:iam::<acct-id>:role/SandboxServiceRole"
+  "refund_limit": 1000
 }
 
