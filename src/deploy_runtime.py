@@ -1,5 +1,4 @@
 import io
-import os
 import json
 import time
 import uuid
@@ -29,12 +28,11 @@ def main():
 
     s3_key = f"{prefix}/runtime_agent_app_{int(time.time())}.zip"
 
-    # 1) Zip + upload agent code
+    # Zip + upload runtime code
     zip_bytes = make_zip_bytes("src/runtime_agent_app.py")
     s3 = boto3.client("s3", region_name=region)
     s3.put_object(Bucket=bucket, Key=s3_key, Body=zip_bytes)
 
-    # 2) Create runtime
     control = boto3.client("bedrock-agentcore-control", region_name=region)
 
     runtime_resp = control.create_agent_runtime(
@@ -43,27 +41,23 @@ def main():
             "codeConfiguration": {
                 "code": {"s3": {"bucket": bucket, "prefix": s3_key}},
                 "runtime": "PYTHON_3_11",
-                # entryPoint is a list; module:function style works for code deployments
                 "entryPoint": ["runtime_agent_app:handler"],
             }
         },
         roleArn=runtime_role_arn,
-        networkConfiguration={
-            "networkMode": network_mode
-        },
+        networkConfiguration={"networkMode": network_mode},
         protocolConfiguration={"serverProtocol": "HTTP"},
-        description="Policy E2E runtime that calls AgentCore Gateway tool via MCP",
+        description="Policy E2E runtime (no JWT) that calls AgentCore Gateway MCP tool",
         tags={"purpose": "agentcore-policy-e2e"}
     )
 
     agent_runtime_id = runtime_resp["agentRuntimeId"]
     agent_runtime_arn = runtime_resp["agentRuntimeArn"]
 
-    # 3) Create endpoint
     endpoint_resp = control.create_agent_runtime_endpoint(
         agentRuntimeId=agent_runtime_id,
         name=endpoint_name,
-        clientToken=str(uuid.uuid4()).replace("-", "") + str(uuid.uuid4()).replace("-", "")
+        clientToken=uuid.uuid4().hex
     )
 
     out = {
@@ -74,7 +68,7 @@ def main():
         "endpointName": endpoint_resp["endpointName"],
         "status": endpoint_resp["status"],
         "runtimeArtifactS3": {"bucket": bucket, "key": s3_key},
-        # helpful to carry gateway details forward
+
         "gateway_url": gw["gateway_url"],
         "target_name": gw["target_name"],
         "tool_name": gw["tool_name"]
@@ -84,9 +78,9 @@ def main():
         json.dump(out, f, indent=2)
 
     print("✅ Runtime + endpoint created.")
-    print(f"agentRuntimeArn: {out['agentRuntimeArn']}")
-    print(f"agentRuntimeEndpointArn: {out['agentRuntimeEndpointArn']}")
-    print(f"qualifier (endpointName): {out['endpointName']}")
+    print("agentRuntimeArn:", out["agentRuntimeArn"])
+    print("agentRuntimeEndpointArn:", out["agentRuntimeEndpointArn"])
+    print("qualifier (endpointName):", out["endpointName"])
     print("Wrote config_runtime_agent.json")
 
 if __name__ == "__main__":
