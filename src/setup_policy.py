@@ -1,264 +1,273 @@
+#!/usr/bin/env python3
 import json
+import os
 import time
-from pathlib import Path
+import uuid
+from typing import Any, Dict, Optional
 
 import boto3
+from botocore.exceptions import ClientError, ParamValidationError
 
 
-HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent
-CFG_PATH = ROOT / "config.json"
+HERE = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(HERE, ".."))
+CONFIG_PATH = os.path.join(PROJECT_ROOT, "config.json")
 
 
-def load_cfg():
-    if not CFG_PATH.exists():
-        raise SystemExit(f"Missing config.json at {CFG_PATH}")
-    return json.loads(CFG_PATH.read_text())
+def load_config() -> Dict[str, Any]:
+    if not os.path.exists(CONFIG_PATH):
+        raise SystemExit(f"config.json not found at: {CONFIG_PATH}")
+    with open(CONFIG_PATH, "r") as f:
+        return json.load(f)
 
 
-def now_suffix():
+def now_suffix() -> str:
     return str(int(time.time()))
 
 
-def require(cfg, key):
-    v = cfg.get(key)
-    if not v:
-        raise SystemExit(f"config.json missing required field: {key}")
-    return v
+def safe_get(d: Dict[str, Any], *keys, default=None):
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return default
 
 
-def build_refund_tool_schema(refund_limit: int, tool_name: str):
-    # Tool schema for MCP gateway -> Lambda tool
-    # Keep it minimal and explicit
-    return [
-        {
-            "name": tool_name,
-            "description": f"Process a refund request up to ${refund_limit}.",
-            "inputSchema": {
-                "json": {
-                    "type": "object",
-                    "properties": {
-                        "amount": {
-                            "type": "number",
-                            "description": f"Refund amount in USD (must be <= {refund_limit}).",
-                        },
-                        "reason": {"type": "string", "description": "Reason for refund."},
-                    },
-                    "required": ["amount", "reason"],
-                }
+def print_header(cfg: Dict[str, Any]) -> None:
+    print(f"\n{PROJECT_ROOT}")
+    print(f"Region: {cfg['region']}")
+    print(f"Gateway prefix: {cfg.get('gateway_name_prefix', 'policy-gateway')}")
+    print(f"Target/tool: {cfg.get('target_name','RefundTarget')} / {cfg.get('tool_name','process_refund')}")
+    print(f"Refund limit: {cfg.get('refund_limit', 1000)}")
+    print(f"Gateway role: {cfg.get('gateway_service_role_arn')}")
+    print(f"Using existing Lambda: {cfg.get('existing_lambda_arn')}\n")
+
+
+def tool_schema(tool_name: str) -> Dict[str, Any]:
+    # A simple schema AgentCore can expose to models/tools:
+    return {
+        "name": tool_name,
+        "description": "Process a refund request (demo tool).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "amount": {"type": "integer", "description": "Refund amount in USD."},
+                "reason": {"type": "string", "description": "Reason for the refund."},
+                "orderId": {"type": "string", "description": "Order identifier."},
             },
-        }
-    ]
+            "required": ["amount", "reason"],
+            "additionalProperties": False,
+        },
+    }
 
 
-def build_cedar_policy(refund_limit: int):
-    """
-    Cedar policy example: allow InvokeTool only if the requested refund amount <= refund_limit.
-    This is a *real* policy string that the policy engine consumes.
-
-    NOTE: Exact action/resource/entity names vary by service. The point of this E2E test is:
-    - You attach a policy engine in ENFORCED mode
-    - You run requests with amount <= limit (allowed) and > limit (denied)
-    If your environment requires different principal/action names, we can adjust after you
-    get the policy engine created successfully.
-    """
+def cedar_policy_text(refund_limit: int, tool_name: str) -> str:
+    # NOTE: Cedar syntax can vary by example. The key point is:
+    # - enforce based on an attribute (amount) and the tool action.
+    # We keep it simple: allow the tool only when amount <= limit.
     return f"""
-permit(
+permit (
   principal,
-  action,
+  action == Action::"{tool_name}",
   resource
 )
 when {{
-  // Allow only if the request context includes amount <= {refund_limit}
-  context.amount <= {refund_limit}
+  resource.amount <= {refund_limit}
 }};
 """.strip()
 
 
-def main():
-    cfg = load_cfg()
+def create_gateway(ac, name: str, role_arn: str) -> Dict[str, Any]:
+    # This matches the “create gateway” behavior you already saw succeed.
+    resp = ac.create_gateway(
+        name=name,
+        description="MCP Gateway for AgentCore policy E2E test",
+        roleArn=role_arn,
+        clientToken=str(uuid.uuid4()),
+        protocolType="MCP",
+    )
+    return resp
 
-    region = cfg.get("region", "us-east-1")
 
-    gateway_role_arn = require(cfg, "gateway_service_role_arn")
-    gateway_prefix = cfg.get("gateway_name_prefix", "policy-gateway")
-    target_name = cfg.get("target_name", "RefundTarget")
-    tool_name = cfg.get("tool_name", "process_refund")
+def wait_gateway_ready(ac, gateway_arn: str, timeout_s: int = 120) -> None:
+    t0 = time.time()
+    while True:
+        r = ac.get_gateway(gatewayArn=gateway_arn)
+        status = r.get("status")
+        if status in ("READY", "ACTIVE"):
+            return
+        if time.time() - t0 > timeout_s:
+            raise SystemExit(f"Gateway did not become READY in {timeout_s}s. Last status={status}")
+        time.sleep(3)
 
-    refund_limit = int(cfg.get("refund_limit", 1000))
 
-    existing_lambda_arn = require(cfg, "existing_lambda_arn")
+def try_create_gateway_target(
+    ac,
+    gateway_arn: str,
+    target_name: str,
+    lambda_arn: str,
+    tool_name: str,
+    refund_limit: int,
+) -> Dict[str, Any]:
+    """
+    Your environment shows:
+    - policyEngineConfiguration exists on CreateGatewayTarget
+    - but CreatePolicyEngine doesn't accept policy content
+    So we attach policy inline at target creation.
 
-    # Optional: if you already have one created
-    policy_engine_arn = cfg.get("policy_engine_arn")
-    policy_engine_mode = cfg.get("policy_engine_mode", "ENFORCED")
+    Because SDK models vary, we try a few shapes.
+    """
 
-    print("Region:", region)
-    print("Gateway prefix:", gateway_prefix)
-    print("Target/tool:", target_name, "/", tool_name)
-    print("Refund limit:", refund_limit)
-    print("Gateway role:", gateway_role_arn)
-    print("Using existing Lambda:", existing_lambda_arn)
+    ts = tool_schema(tool_name)
+    cedar = cedar_policy_text(refund_limit, tool_name)
 
-    ac = boto3.client("bedrock-agentcore-control", region_name=region)
-
-    # ---------------------------
-    # 1) Ensure policy engine ARN
-    # ---------------------------
-    if not policy_engine_arn:
-        cedar_policy = build_cedar_policy(refund_limit)
-
-        # Try to create policy engine if API exists in this SDK
-        if hasattr(ac, "create_policy_engine"):
-            pe_name = f"{gateway_prefix}-pe-{now_suffix()}"
-            print("Creating policy engine:", pe_name)
-
-            # IMPORTANT: signature may differ slightly by region/SDK.
-            # We'll try the most common pattern and fail loudly if it doesn't match.
-            try:
-                pe_resp = ac.create_policy_engine(
-                    name=pe_name,
-                    description="Refund policy engine (Cedar)",
-                    roleArn=gateway_role_arn,
-                    policyType="CEDAR",
-                    policyContent=cedar_policy,
-                )
-            except TypeError as e:
-                raise SystemExit(
-                    "Your boto3 model for create_policy_engine has a different signature.\n"
-                    "Run this in a notebook cell to see required params:\n\n"
-                    "import boto3, json\n"
-                    "ac=boto3.client('bedrock-agentcore-control', region_name='us-east-1')\n"
-                    "op=ac.meta.service_model.operation_model('CreatePolicyEngine')\n"
-                    "print(op.input_shape.members.keys())\n\n"
-                    f"Original error: {e}"
-                )
-
-            # Try a few likely response shapes
-            policy_engine_arn = (
-                pe_resp.get("arn")
-                or (pe_resp.get("policyEngine") or {}).get("arn")
-                or (pe_resp.get("policy_engine") or {}).get("arn")
-            )
-            if not policy_engine_arn:
-                raise SystemExit(
-                    "Created policy engine but could not find arn in response.\n"
-                    f"Response keys: {list(pe_resp.keys())}\n"
-                    "Paste the response and I’ll map the field."
-                )
-
-            print("Policy engine ARN:", policy_engine_arn)
-            print(
-                "\n✅ Add this to config.json so you don't need to re-create next time:\n"
-                f'  "policy_engine_arn": "{policy_engine_arn}"\n'
-            )
-        else:
-            # Can't create in this environment via SDK, so require it in config
-            raise SystemExit(
-                "Your boto3 client does NOT expose create_policy_engine(), but CreateGateway requires "
-                "policyEngineConfiguration.\n\n"
-                "Fix: create a Policy Engine once (console/other pipeline) and add to config.json:\n"
-                '  "policy_engine_arn": "arn:..."\n'
-            )
-    else:
-        print("Using policy engine ARN from config.json:", policy_engine_arn)
-
-    # ---------------------------
-    # 2) Create Gateway (MCP)
-    # ---------------------------
-    gateway_name = f"{gateway_prefix}-{now_suffix()}"
-    print("\nCreating gateway:", gateway_name)
-
-    # Your schema says CreateGateway supports: protocolConfiguration (mcp...) and policyEngineConfiguration (arn, mode)
-    gw_resp = ac.create_gateway(
-        name=gateway_name,
-        description="Policy E2E gateway (Lambda target)",
-        roleArn=gateway_role_arn,
+    base_req = dict(
+        gatewayArn=gateway_arn,
+        name=target_name,
+        description="Refund tool target (Lambda) behind MCP gateway",
+        clientToken=str(uuid.uuid4()),
         protocolType="MCP",
         protocolConfiguration={
             "mcp": {
                 "supportedVersions": ["2024-11-05"],
-                "instructions": (
-                    "You are a policy-protected gateway. "
-                    "Call the refund tool only when allowed by policy."
-                ),
-                "searchType": "NONE",
+                "instructions": "Refund tool MCP target",
             }
         },
-        authorizerType="NONE",
-        policyEngineConfiguration={
-            "arn": policy_engine_arn,
-            "mode": policy_engine_mode,
-        },
-        tags={"purpose": "agentcore-policy-e2e"},
-    )
-
-    gateway_id = (
-        gw_resp.get("gatewayId")
-        or (gw_resp.get("gateway") or {}).get("gatewayId")
-        or (gw_resp.get("gateway") or {}).get("id")
-        or gw_resp.get("id")
-    )
-    gateway_endpoint = (
-        gw_resp.get("endpoint")
-        or (gw_resp.get("gateway") or {}).get("endpoint")
-        or (gw_resp.get("gateway") or {}).get("mcpEndpoint")
-    )
-
-    if not gateway_id:
-        raise SystemExit(
-            "Could not find gateway id in create_gateway response.\n"
-            f"Response keys: {list(gw_resp.keys())}\n"
-            "Paste gw_resp and I’ll map the field."
-        )
-
-    print("Gateway id:", gateway_id)
-    if gateway_endpoint:
-        print("Gateway endpoint:", gateway_endpoint)
-
-    # ---------------------------
-    # 3) Create Gateway Target (Lambda tool)
-    # ---------------------------
-    tool_schema = build_refund_tool_schema(refund_limit, tool_name)
-
-    print("\nCreating gateway target:", target_name)
-    tgt_resp = ac.create_gateway_target(
-        gatewayId=gateway_id,
-        name=target_name,
         targetConfiguration={
-            "mcp": {
-                "lambda": {
-                    "lambdaArn": existing_lambda_arn,
-                    "toolSchema": {"inlinePayload": tool_schema},
-                }
+            "lambda": {
+                "lambdaArn": lambda_arn,
+                "toolSchema": ts,
             }
         },
+        # IMPORTANT: do NOT include credentialProvider anywhere.
+        # Your errors show that field is not allowed.
     )
 
-    target_id = (
-        tgt_resp.get("targetId")
-        or (tgt_resp.get("target") or {}).get("targetId")
-        or tgt_resp.get("id")
-    )
-    print("Target created:", target_id or "(id not returned)")
-
-    # ---------------------------
-    # 4) Write outputs for later steps/tests
-    # ---------------------------
-    out = {
-        "region": region,
-        "gateway_name": gateway_name,
-        "gateway_id": gateway_id,
-        "gateway_endpoint": gateway_endpoint,
-        "target_name": target_name,
-        "tool_name": tool_name,
-        "existing_lambda_arn": existing_lambda_arn,
-        "policy_engine_arn": policy_engine_arn,
-        "refund_limit": refund_limit,
+    # Variant A: policyEngineConfiguration with INLINE arn + cedar bundle
+    variant_a = dict(base_req)
+    variant_a["policyEngineConfiguration"] = {
+        "arn": "INLINE",
+        "mode": "ENFORCE",
+        "cedar": {
+            "policies": [
+                {"policyId": "refund-policy", "policyContent": cedar}
+            ]
+        },
     }
 
-    (ROOT / "outputs.json").write_text(json.dumps(out, indent=2))
-    print("\nWrote outputs.json. Next run: python src/test_policy.py")
+    # Variant B: policyEngineConfiguration without arn (some models require only mode + cedar)
+    variant_b = dict(base_req)
+    variant_b["policyEngineConfiguration"] = {
+        "mode": "ENFORCE",
+        "cedar": {
+            "policies": [
+                {"policyId": "refund-policy", "policyContent": cedar}
+            ]
+        },
+    }
+
+    # Variant C: policyEngineConfiguration only references arn/mode (if inline policy not supported)
+    # (You would then need an existing policy engine ARN in config. This is a fallback.)
+    variant_c = dict(base_req)
+    pe_arn = None
+    # allow either policy_engine_arn or policyEngineArn in config if you add it later
+    # but we won’t require it now
+    # If missing, we skip this variant.
+    # (kept for future)
+    # variant_c["policyEngineConfiguration"] = {"arn": pe_arn, "mode": "ENFORCE"}
+
+    attempts = [
+        ("A (INLINE arn + cedar.policies)", variant_a),
+        ("B (no arn + cedar.policies)", variant_b),
+    ]
+
+    last_err: Optional[Exception] = None
+    for label, req in attempts:
+        try:
+            print(f"[2/3] Creating Gateway Target using policy variant {label} ...")
+            resp = ac.create_gateway_target(**req)
+            return resp
+        except (ParamValidationError, ClientError) as e:
+            last_err = e
+            msg = str(e)
+            print(f"  -> Variant {label} failed.")
+            # helpful prints (short)
+            if "Unknown parameter" in msg or "Parameter validation failed" in msg:
+                print("     (SDK model mismatch on policy fields; trying next variant)")
+            else:
+                print(f"     {msg[:400]}")
+            continue
+
+    # If we got here, none worked.
+    raise SystemExit(
+        "\nNone of the inline policy variants worked in your environment.\n"
+        "This usually means your account/SDK requires an existing Policy Engine ARN.\n"
+        "If you can obtain a pre-created policy engine ARN from your platform team, add it to config.json as:\n"
+        '  "policy_engine_arn": "arn:aws:bedrock-agentcore:...:policy-engine/..." \n'
+        "and I’ll give you the exact single-call Target config for that.\n"
+        f"\nLast error: {last_err}\n"
+    )
+
+
+def main():
+    cfg = load_config()
+
+    # REQUIRED config keys
+    region = cfg["region"]
+    gateway_role = cfg["gateway_service_role_arn"]
+    existing_lambda_arn = cfg["existing_lambda_arn"]
+
+    gateway_prefix = cfg.get("gateway_name_prefix", "policy-gateway")
+    gateway_name = f"{gateway_prefix}-{now_suffix()}"
+
+    target_name = cfg.get("target_name", "RefundTarget")
+    tool_name = cfg.get("tool_name", "process_refund")
+    refund_limit = int(cfg.get("refund_limit", 1000))
+
+    print_header(cfg)
+
+    ac = boto3.client("bedrock-agentcore-control", region_name=region)
+
+    print(f"[1/3] Creating Gateway: {gateway_name}")
+    gw_resp = create_gateway(ac, gateway_name, gateway_role)
+
+    gateway_arn = gw_resp.get("gatewayArn") or gw_resp.get("arn")
+    gateway_endpoint = gw_resp.get("gatewayEndpoint") or gw_resp.get("endpoint") or gw_resp.get("url")
+
+    if not gateway_arn:
+        # print full response for debugging
+        print("CreateGateway response:\n", json.dumps(gw_resp, indent=2, default=str))
+        raise SystemExit("Could not find gatewayArn in CreateGateway response.")
+
+    # wait until READY
+    wait_gateway_ready(ac, gateway_arn)
+    # re-fetch to get endpoint if needed
+    gw_get = ac.get_gateway(gatewayArn=gateway_arn)
+    gateway_endpoint = gateway_endpoint or gw_get.get("gatewayEndpoint") or gw_get.get("endpoint") or gw_get.get("url")
+
+    if gateway_endpoint:
+        print(f"Gateway READY: {gateway_endpoint}")
+    else:
+        print("Gateway READY (endpoint not returned by this SDK response).")
+
+    target_resp = try_create_gateway_target(
+        ac=ac,
+        gateway_arn=gateway_arn,
+        target_name=target_name,
+        lambda_arn=existing_lambda_arn,
+        tool_name=tool_name,
+        refund_limit=refund_limit,
+    )
+
+    target_arn = target_resp.get("targetArn") or target_resp.get("arn")
+    print("\n[3/3] DONE")
+    print(f"Gateway ARN : {gateway_arn}")
+    if gateway_endpoint:
+        print(f"MCP URL     : {gateway_endpoint}/mcp" if not str(gateway_endpoint).endswith("/mcp") else f"MCP URL     : {gateway_endpoint}")
+    print(f"Target ARN  : {target_arn}")
+
+    print("\nNext step:")
+    print(" - Run your runtime deploy / invoke scripts (deploy_runtime_jwt.py, invoke_runtime_jwt.py) as you planned.")
+    print(" - For policy proof: invoke tool with amount <= limit (allowed) and > limit (denied).")
 
 
 if __name__ == "__main__":
