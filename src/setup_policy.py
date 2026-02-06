@@ -1,25 +1,20 @@
-"""
-Setup script to create Gateway with Policy Engine (AWS tutorial style, but reuses existing IAM roles)
-
-Run:
-  python src/setup_policy.py
-
-Reads:
-  config.json
-
-Writes:
-  config_runtime.json  (contains created resource IDs + client_info)
-"""
-
+import io
 import json
-import logging
 import time
+import uuid
+import zipfile
 import boto3
+from botocore.exceptions import ClientError
 
-from bedrock_agentcore_starter_toolkit.operations.gateway.client import GatewayClient
-from bedrock_agentcore_starter_toolkit.operations.policy.client import PolicyClient
-from bedrock_agentcore_starter_toolkit.utils.lambda_utils import create_lambda_function
-
+def wait_for(fn, timeout_s=420, sleep_s=5, desc="wait"):
+    start = time.time()
+    while True:
+        ok, val = fn()
+        if ok:
+            return val
+        if time.time() - start > timeout_s:
+            raise TimeoutError(f"Timed out: {desc}")
+        time.sleep(sleep_s)
 
 def main():
     with open("config.json", "r") as f:
@@ -27,162 +22,194 @@ def main():
 
     region = cfg["region"]
     refund_limit = int(cfg["refund_limit"])
+
     lambda_exec_role_arn = cfg["lambda_exec_role_arn"]
     gateway_service_role_arn = cfg["gateway_service_role_arn"]
-    gateway_name_prefix = cfg.get("gateway_name_prefix", "policy-gateway")
-    lambda_fn_prefix = cfg.get("lambda_function_name_prefix", "RefundTool")
+
+    gateway_name = f"{cfg.get('gateway_name_prefix','policy-gateway')}-{int(time.time())}"
     target_name = cfg.get("target_name", "RefundTarget")
     tool_name = cfg.get("tool_name", "process_refund")
+    lambda_fn_name = f"{cfg.get('lambda_function_name_prefix','RefundTool')}-{int(time.time())}"
 
-    print("Setting up AgentCore Gateway with Policy Engine (replicating AWS tutorial)...")
-    print(f"Region: {region}")
-    print(f"Refund limit: {refund_limit}")
-    print(f"Using existing Lambda exec role: {lambda_exec_role_arn}")
-    print(f"Using existing Gateway service role: {gateway_service_role_arn}\n")
+    lam = boto3.client("lambda", region_name=region)
+    ac  = boto3.client("bedrock-agentcore-control", region_name=region)
 
-    # Initialize clients (starter toolkit)
-    gateway_client = GatewayClient(region_name=region)
-    gateway_client.logger.setLevel(logging.INFO)
+    print("Region:", region)
+    print("Gateway name:", gateway_name)
+    print("Target/tool:", f"{target_name}___{tool_name}")
+    print("Refund limit:", refund_limit)
+    print("Using roles:")
+    print(" - Lambda exec role:", lambda_exec_role_arn)
+    print(" - Gateway service role:", gateway_service_role_arn)
 
-    policy_client = PolicyClient(region_name=region)
-    policy_client.logger.setLevel(logging.INFO)
-
-    # Step 1: Create OAuth authorizer (Cognito)
-    print("Step 1: Creating OAuth authorization server (Cognito)...")
-    cognito_response = gateway_client.create_oauth_authorizer_with_cognito(gateway_name_prefix)
-    print("✓ Authorization server created\n")
-
-    # Step 2: Create Gateway (MCP)
-    print("Step 2: Creating Gateway (MCP endpoint)...")
-    # IMPORTANT: we pass role_arn explicitly to avoid any role creation behavior.
-    gateway = gateway_client.create_mcp_gateway(
-        name=None,
-        role_arn=gateway_service_role_arn,
-        authorizer_config=cognito_response["authorizer_config"],
-        enable_semantic_search=False,
-    )
-    print(f"✓ Gateway created: {gateway['gatewayUrl']}\n")
-
-    # Step 3: Create Lambda function with refund tool (intentionally permissive)
-    print("Step 3: Creating Lambda function (tool implementation)...")
-    refund_lambda_code = f"""
+    # 1) Create permissive Lambda tool
+    lambda_code = f"""
 def lambda_handler(event, context):
-    # Intentionally permissive: approves any amount.
-    amount = event.get('amount', 0)
+    amount = None
+    try:
+        if isinstance(event, dict):
+            amount = event.get("amount") or (event.get("arguments") or {{}}).get("amount")
+    except Exception:
+        pass
     return {{
-        "status": "success",
-        "message": f"Refund of ${{amount}} processed successfully (tool did not enforce limit)",
-        "amount": amount
+        "approved": True,
+        "amount": amount,
+        "note": "Lambda approves everything; Gateway policy should enforce limit.",
+        "echo": event
     }}
 """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("lambda_function.py", lambda_code)
+    zip_bytes = buf.getvalue()
 
-    session = boto3.Session(region_name=region)
-
-    # create_lambda_function lets us pass gateway role; we also pass our exec role
-    # NOTE: lambda_utils implementation can vary by version; if it doesn't support exec_role_arn,
-    # we fall back to default behavior of the toolkit.
-    lambda_arn = create_lambda_function(
-        session=session,
-        logger=gateway_client.logger,
-        function_name=f"{lambda_fn_prefix}-{int(time.time())}",
-        lambda_code=refund_lambda_code,
-        runtime="python3.11",
-        handler="lambda_function.lambda_handler",
-        gateway_role_arn=gateway["roleArn"],
-        description="Refund tool for policy demo",
-        exec_role_arn=lambda_exec_role_arn,  # if unsupported in your toolkit version, remove this line
+    fn = lam.create_function(
+        FunctionName=lambda_fn_name,
+        Runtime="python3.11",
+        Role=lambda_exec_role_arn,
+        Handler="lambda_function.lambda_handler",
+        Code={"ZipFile": zip_bytes},
+        Timeout=15,
+        MemorySize=128,
+        Publish=True,
     )
-    print(f"✓ Lambda function created: {lambda_arn}\n")
+    lambda_arn = fn["FunctionArn"]
+    print("\n[1/6] Created Lambda:", lambda_arn)
 
-    # Step 4: Add Lambda target with refund tool schema
-    print("Step 4: Adding Lambda target + tool schema...")
-    tool_schema = {
-        "inlinePayload": [
-            {
-                "name": tool_name,
-                "description": "Process a customer refund",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "amount": {
-                            "type": "integer",
-                            "description": "Refund amount in dollars"
-                        }
-                    },
-                    "required": ["amount"]
+    # Allow AgentCore service principal to invoke Lambda (resource policy)
+    try:
+        lam.add_permission(
+            FunctionName=lambda_fn_name,
+            StatementId=f"AllowAgentCoreInvoke-{uuid.uuid4().hex[:8]}",
+            Action="lambda:InvokeFunction",
+            Principal="bedrock-agentcore.amazonaws.com",
+        )
+        print("[1/6] Added Lambda permission for bedrock-agentcore.amazonaws.com")
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ResourceConflictException":
+            print("[1/6] Lambda permission already existed")
+        else:
+            raise
+
+    # 2) Create Gateway (MCP) - NO authorizer for now
+    gw = ac.create_gateway(
+        name=gateway_name,
+        description="Policy E2E gateway (boto3-only).",
+        roleArn=gateway_service_role_arn,
+        protocolType="MCP",
+        authorizerType="NONE",
+    )
+    gateway_id  = gw["gatewayId"]
+    gateway_arn = gw["gatewayArn"]
+    gateway_url = gw["gatewayUrl"]
+    print("\n[2/6] Created Gateway:", gateway_url)
+
+    def gw_ready():
+        g = ac.get_gateway(gatewayIdentifier=gateway_id)
+        return (g["status"] == "READY"), g
+
+    g = wait_for(gw_ready, desc="gateway READY")
+    print("[2/6] Gateway status:", g["status"])
+
+    # 3) Create Gateway Target with tool schema
+    tool_schema = [{
+        "name": tool_name,
+        "description": "Process a refund",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "amount": {"type": "integer", "description": "Refund amount"}
+            },
+            "required": ["amount"]
+        }
+    }]
+
+    t = ac.create_gateway_target(
+        gatewayIdentifier=gateway_id,
+        name=target_name,
+        description="Refund tool target",
+        targetConfiguration={
+            "mcp": {
+                "lambda": {
+                    "lambdaArn": lambda_arn,
+                    "toolSchema": {"inlinePayload": tool_schema}
                 }
             }
-        ]
-    }
-
-    lambda_target = gateway_client.create_mcp_gateway_target(
-        gateway=gateway,
-        name=target_name,
-        target_type="lambda",
-        target_payload={
-            "lambdaArn": lambda_arn,
-            "toolSchema": tool_schema
-        },
-        credentials=None
+        }
     )
-    print("✓ Lambda target added\n")
+    print("\n[3/6] Created Target:", {"name": target_name, "targetId": t.get("targetId")})
 
-    # Step 5: Create Policy Engine
-    print("Step 5: Creating Policy Engine...")
-    engine = policy_client.create_or_get_policy_engine(
-        name="RefundPolicyEngine",
+    # 4) Create Policy Engine
+    pe = ac.create_policy_engine(
+        name=f"refund-policy-engine-{int(time.time())}",
         description="Policy engine for refund governance"
     )
-    print(f"✓ Policy Engine created: {engine['policyEngineId']}\n")
+    policy_engine_id = pe["policyEngineId"]
+    policy_engine_arn = pe["policyEngineArn"]
+    print("\n[4/6] Created Policy Engine:", policy_engine_id)
 
-    # Step 6: Create Cedar policy (doc pattern)
-    print(f"Step 6: Creating Cedar policy (allow < {refund_limit})...")
-    cedar_statement = (
-        f'permit(principal, '
-        f'action == AgentCore::Action::"{target_name}___{tool_name}", '
-        f'resource == AgentCore::Gateway::"{gateway["gatewayArn"]}") '
-        f'when {{ context.input.amount < {refund_limit} }};'
+    def pe_ready():
+        p = ac.get_policy_engine(policyEngineId=policy_engine_id)
+        return (p.get("status") in ("READY", "ACTIVE")), p
+
+    p = wait_for(pe_ready, desc="policy engine READY/ACTIVE")
+    print("[4/6] Policy engine status:", p.get("status"))
+
+    # 5) Create Cedar policy
+    action_name = f"{target_name}___{tool_name}"
+    cedar = f'''permit(principal,
+  action == AgentCore::Action::"{action_name}",
+  resource == AgentCore::Gateway::"{gateway_arn}")
+when {{
+  context.input.amount < {refund_limit}
+}};'''
+
+    pol = ac.create_policy(
+        name=f"refund-under-{refund_limit}-{int(time.time())}",
+        description=f"Allow refunds with amount < {refund_limit}",
+        definition={"cedar": {"statement": cedar}},
+        validationMode="FAIL_ON_ANY_FINDINGS",
+        policyEngineId=policy_engine_id,
     )
+    policy_id = pol["policyId"]
+    print("\n[5/6] Created Policy:", policy_id)
 
-    policy = policy_client.create_or_get_policy(
-        policy_engine_id=engine["policyEngineId"],
-        name="refund_limit_policy",
-        description=f"Allow refunds under ${refund_limit}",
-        definition={"cedar": {"statement": cedar_statement}},
+    def pol_ready():
+        pr = ac.get_policy(policyId=policy_id)
+        return (pr.get("status") in ("READY", "ACTIVE")), pr
+
+    pr = wait_for(pol_ready, desc="policy READY/ACTIVE")
+    print("[5/6] Policy status:", pr.get("status"))
+
+    # 6) Attach Policy Engine to Gateway in ENFORCE
+    ac.update_gateway(
+        gatewayIdentifier=gateway_id,
+        policyEngineConfiguration={"arn": policy_engine_arn, "mode": "ENFORCE"},
     )
-    print(f"✓ Policy created: {policy['policyId']}\n")
+    print("\n[6/6] Attached Policy Engine to Gateway in ENFORCE mode")
 
-    # Step 7: Attach Policy Engine to Gateway (ENFORCE)
-    print("Step 7: Attaching Policy Engine to Gateway (ENFORCE mode)...")
-    gateway_client.update_gateway_policy_engine(
-        gateway_identifier=gateway["gatewayId"],
-        policy_engine_arn=engine["policyEngineArn"],
-        mode="ENFORCE"
-    )
-    print("✓ Policy Engine attached to Gateway\n")
+    g2 = wait_for(gw_ready, desc="gateway READY after policy attach")
+    print("[6/6] Gateway status:", g2["status"])
 
-    # Step 8: Save runtime configuration for test/cleanup
-    runtime = {
+    runtime_cfg = {
         "region": region,
         "refund_limit": refund_limit,
-        "gateway_url": gateway["gatewayUrl"],
-        "gateway_id": gateway["gatewayId"],
-        "gateway_arn": gateway["gatewayArn"],
-        "gateway_role_arn": gateway["roleArn"],
-        "policy_engine_id": engine["policyEngineId"],
-        "policy_engine_arn": engine["policyEngineArn"],
-        "policy_id": policy["policyId"],
-        "client_info": cognito_response["client_info"],
+        "gateway_id": gateway_id,
+        "gateway_arn": gateway_arn,
+        "gateway_url": gateway_url,
         "target_name": target_name,
         "tool_name": tool_name,
+        "lambda_function_name": lambda_fn_name,
         "lambda_arn": lambda_arn,
+        "policy_engine_id": policy_engine_id,
+        "policy_engine_arn": policy_engine_arn,
+        "policy_id": policy_id
     }
 
     with open("config_runtime.json", "w") as f:
-        json.dump(runtime, f, indent=2)
+        json.dump(runtime_cfg, f, indent=2)
 
-    print("✅ Setup complete. Wrote config_runtime.json")
-
+    print("\n✅ Setup complete. Wrote config_runtime.json")
 
 if __name__ == "__main__":
     main()
