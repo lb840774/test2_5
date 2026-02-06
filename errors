@@ -1,157 +1,171 @@
 import json
-from typing import Any, Dict
+import base64
 
-VERSION = "v2026-02-06-01"
-
-def _safe_json(obj: Any) -> str:
-    try:
-        return json.dumps(obj)
-    except Exception:
-        return str(obj)
-
-def _try_json(x: Any) -> Any:
-    # If the gateway sends a JSON string, parse it
+def _try_json(x):
+    if x is None:
+        return None
+    if isinstance(x, (dict, list)):
+        return x
+    if isinstance(x, (bytes, bytearray)):
+        try:
+            x = x.decode("utf-8")
+        except Exception:
+            return None
     if isinstance(x, str):
         s = x.strip()
-        if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
-            try:
-                return json.loads(s)
-            except Exception:
-                return x
-    return x
+        if not s:
+            return None
+        try:
+            return json.loads(s)
+        except Exception:
+            return None
+    return None
 
-def _normalize_req(event: Any) -> Dict[str, Any]:
+def _normalize_event(event):
     """
-    Normalize event to the JSON-RPC request dict.
-    Sometimes gateways nest under "payload"/"input"/"arguments".
+    Try very hard to find the "real" request payload regardless of how AgentCore Gateway invokes us.
     """
-    if isinstance(event, dict):
-        # If it already looks like JSON-RPC
-        if "method" in event and ("params" in event or "id" in event):
-            return event
+    # 1) If a string body exists (common in API GW-ish wrappers)
+    body = event.get("body")
+    jb = _try_json(body)
+    if jb is not None:
+        return jb
 
-        # Try common wrappers
-        for k in ("payload", "input", "arguments"):
-            v = event.get(k)
-            if isinstance(v, dict) and "method" in v:
-                return v
+    # 2) If body is base64 encoded
+    if event.get("isBase64Encoded") and isinstance(body, str):
+        try:
+            decoded = base64.b64decode(body).decode("utf-8")
+            jb = _try_json(decoded)
+            if jb is not None:
+                return jb
+        except Exception:
+            pass
 
-    return event if isinstance(event, dict) else {}
+    # 3) Common wrapper keys we’ve seen in gateways / runtimes
+    for k in ("payload", "input", "request", "event", "detail"):
+        if k in event:
+            candidate = _try_json(event.get(k))
+            if isinstance(candidate, dict):
+                # if the candidate itself wraps the request again, keep digging
+                if any(x in candidate for x in ("jsonrpc", "method", "params", "name", "toolName", "tool")):
+                    return candidate
 
-def _is_refund_tool(name: str) -> bool:
-    if not name:
-        return False
-    # Accept plain tool name OR prefixed tool name (target-...__process_refund)
-    return name == "process_refund" or name.endswith("__process_refund")
+    # 4) Already a dict request
+    return event
 
-def _resp(req: Dict[str, Any], result: Dict[str, Any] = None, error: Dict[str, Any] = None) -> Dict[str, Any]:
-    out = {
-        "jsonrpc": req.get("jsonrpc", "2.0"),
-        "id": req.get("id"),
-    }
-    if error is not None:
-        out["error"] = error
-    else:
-        out["result"] = result or {}
-    return out
-
-def lambda_handler(event, context):
-    print("LAMBDA VERSION MARKER:", VERSION)
-    print("RAW EVENT:", _safe_json(event))
-
-    req = _normalize_req(event)
-    if not isinstance(req, dict):
-        req = {}
-
-    # Parse params robustly
+def _extract_method_and_params(req):
+    """
+    Support BOTH:
+      A) JSON-RPC MCP:
+         { "jsonrpc":"2.0", "method":"tools/call", "params": {...} }
+      B) Gateway tool invoke shape (method may be absent):
+         { "name": "...", "input": {...} }  OR  { "toolName": "...", "input": {...} }
+         or nested forms like { "tool": {"name": ...}, "input": {...} }
+    """
     method = req.get("method")
     params = req.get("params") or {}
-    params = _try_json(params)
-    if not isinstance(params, dict):
-        params = {}
 
-    print("METHOD:", method)
-    print("PARAMS:", _safe_json(params))
+    # If it's not JSON-RPC, treat it like a tool invocation
+    if not method:
+        # If we see a tool name + input, we can infer tools/call
+        tool_name = req.get("name") or req.get("toolName")
+        tool_obj = req.get("tool") if isinstance(req.get("tool"), dict) else {}
+        tool_name = tool_name or tool_obj.get("name")
 
-    # 1) tools/list
+        tool_input = req.get("input") or req.get("arguments") or {}
+        tool_input = _try_json(tool_input) or tool_input
+
+        if tool_name:
+            method = "tools/call"
+            params = {
+                "name": tool_name,
+                # Gateway ecosystems vary: sometimes it's "input", sometimes "arguments"
+                "input": tool_input if isinstance(tool_input, dict) else {},
+                "arguments": tool_input if isinstance(tool_input, dict) else {},
+            }
+
+    return method, params
+
+def _tool_matches(name):
+    # Accept either the plain name or the gateway-prefixed name like: target-quick-start-XXXX__process_refund
+    if not name:
+        return False
+    return (name == "process_refund") or name.endswith("__process_refund")
+
+def _resp(req, result=None, error=None):
+    # Return JSON-RPC-ish response if id/jsonrpc present; otherwise return a plain object.
+    if isinstance(req, dict) and ("jsonrpc" in req or "id" in req):
+        out = {"jsonrpc": req.get("jsonrpc", "2.0"), "id": req.get("id")}
+        if error is not None:
+            out["error"] = error
+        else:
+            out["result"] = result
+        return out
+    # Non JSON-RPC call path
+    if error is not None:
+        return {"error": error}
+    return {"result": result}
+
+def lambda_handler(event, context):
+    # 🔎 Logs: look in CloudWatch Logs for this Lambda to see these prints
+    print("=== RAW EVENT ===")
+    print(json.dumps(event, default=str)[:10000])
+
+    req = _normalize_event(event)
+    print("=== NORMALIZED REQ ===")
+    print(json.dumps(req, default=str)[:10000])
+
+    method, params = _extract_method_and_params(req)
+    print("=== METHOD/PARAMS ===")
+    print("method:", method)
+    print("params:", json.dumps(params, default=str)[:10000])
+
+    # Handle tools/list
     if method == "tools/list":
         return _resp(req, result={
-            "tools": [
-                {
-                    "name": "process_refund",
-                    "description": "Process a refund request",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "amount": {"type": "integer", "description": "Refund amount"},
-                            "reason": {"type": "string", "description": "Reason for refund"},
-                        },
-                        "required": ["amount", "reason"],
+            "tools": [{
+                "name": "process_refund",
+                "description": "Process a refund request",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "amount": {"type": "integer", "description": "Refund amount"},
+                        "reason": {"type": "string", "description": "Reason for refund"}
                     },
+                    "required": ["amount", "reason"]
                 }
-            ]
+            }]
         })
 
-    # 2) tools/call
+    # Handle tools/call
     if method == "tools/call":
         name = params.get("name")
+        # accept either "arguments" or "input"
+        payload = params.get("arguments")
+        if not isinstance(payload, dict):
+            payload = params.get("input")
+        if not isinstance(payload, dict):
+            payload = {}
 
-        # The tool name coming from the gateway can be prefixed.
-        # Accept both.
-        if not _is_refund_tool(name):
+        if not _tool_matches(name):
             return _resp(req, error={"code": -32601, "message": f"Unknown tool: {name}"})
 
-        # Inputs can arrive in different places depending on client.
-        # Prefer params.arguments, then params.input, then direct params fields.
-        args = params.get("arguments")
-        if args is None:
-            args = params.get("input")
-        if args is None:
-            # sometimes clients send amount/reason at top level
-            args = {"amount": params.get("amount"), "reason": params.get("reason")}
+        # Validate required fields
+        amount = payload.get("amount")
+        reason = payload.get("reason")
+        if amount is None or reason is None:
+            return _resp(req, error={"code": -32602, "message": "Missing required fields: amount, reason"})
 
-        args = _try_json(args)
-        if not isinstance(args, dict):
-            args = {}
-
-        print("TOOL NAME:", name)
-        print("ARGS:", _safe_json(args))
-
-        amount = args.get("amount")
-        reason = args.get("reason")
-
-        missing = []
-        if amount is None:
-            missing.append("amount")
-        if reason is None:
-            missing.append("reason")
-
-        if missing:
-            # Make it super explicit what was missing and what we received
-            return _resp(req, result={
-                "content": [
-                    {
-                        "type": "text",
-                        "text": f"LambdaClientException - Invalid request parameters: Missing required field(s): {missing}. Received args={_safe_json(args)}"
-                    }
-                ],
-                "isError": True
-            })
-
-        # Return a normal MCP-ish response
         return _resp(req, result={
-            "content": [
-                {
-                    "type": "text",
-                    "text": json.dumps({
-                        "status": "OK",
-                        "amount": amount,
-                        "reason": reason,
-                        "message": "Refund processed"
-                    })
-                }
-            ]
+            "content": [{
+                "type": "text",
+                "text": json.dumps({
+                    "status": "OK",
+                    "amount": amount,
+                    "reason": reason,
+                    "message": "Refund processed"
+                })
+            }]
         })
 
-    # Anything else
     return _resp(req, error={"code": -32601, "message": f"Unknown method: {method}"})
