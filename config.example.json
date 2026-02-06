@@ -1,0 +1,12 @@
+{
+  "region": "us-east-1",
+  "refund_limit": 1000,
+
+  "lambda_exec_role_arn": "arn:aws:iam::<acct-id>:role/<existing-lambda-exec-role>",
+  "gateway_service_role_arn": "arn:aws:iam::<acct-id>:role/<existing-agentcore-gateway-role>",
+
+  "gateway_name_prefix": "policy-gateway",
+  "lambda_function_name_prefix": "RefundTool",
+  "target_name": "RefundTarget",
+  "tool_name": "process_refund"
+}
