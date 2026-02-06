@@ -1,0 +1,31 @@
+import os, json
+from dotenv import load_dotenv
+import boto3
+
+load_dotenv()
+
+region = os.getenv("COGNITO_REGION", "us-east-1")
+client_id = os.getenv("COGNITO_CLIENT_ID")
+username = os.getenv("COGNITO_USERNAME")
+password = os.getenv("COGNITO_PASSWORD")
+
+if not all([client_id, username, password]):
+    raise SystemExit("Missing one of COGNITO_CLIENT_ID/COGNITO_USERNAME/COGNITO_PASSWORD")
+
+cognito = boto3.client("cognito-idp", region_name=region)
+resp = cognito.initiate_auth(
+    ClientId=client_id,
+    AuthFlow="USER_PASSWORD_AUTH",
+    AuthParameters={"USERNAME": username, "PASSWORD": password},
+)
+auth = resp["AuthenticationResult"]
+
+print(json.dumps({
+    "expires_in": auth.get("ExpiresIn"),
+    "has_access_token": bool(auth.get("AccessToken")),
+    "has_id_token": bool(auth.get("IdToken")),
+}, indent=2))
+
+print("TOKEN_START")
+print(auth.get("AccessToken") or auth.get("IdToken"))
+print("TOKEN_END")
