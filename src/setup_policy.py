@@ -8,7 +8,6 @@ from typing import Any, Dict, Optional
 import boto3
 from botocore.exceptions import ClientError, ParamValidationError
 
-
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(HERE, ".."))
 CONFIG_PATH = os.path.join(PROJECT_ROOT, "config.json")
@@ -25,13 +24,6 @@ def now_suffix() -> str:
     return str(int(time.time()))
 
 
-def safe_get(d: Dict[str, Any], *keys, default=None):
-    for k in keys:
-        if k in d and d[k] is not None:
-            return d[k]
-    return default
-
-
 def print_header(cfg: Dict[str, Any]) -> None:
     print(f"\n{PROJECT_ROOT}")
     print(f"Region: {cfg['region']}")
@@ -39,11 +31,11 @@ def print_header(cfg: Dict[str, Any]) -> None:
     print(f"Target/tool: {cfg.get('target_name','RefundTarget')} / {cfg.get('tool_name','process_refund')}")
     print(f"Refund limit: {cfg.get('refund_limit', 1000)}")
     print(f"Gateway role: {cfg.get('gateway_service_role_arn')}")
-    print(f"Using existing Lambda: {cfg.get('existing_lambda_arn')}\n")
+    print(f"Using existing Lambda: {cfg.get('existing_lambda_arn')}")
+    print(f"Authorizer type: {cfg.get('authorizer_type','NONE')}\n")
 
 
 def tool_schema(tool_name: str) -> Dict[str, Any]:
-    # A simple schema AgentCore can expose to models/tools:
     return {
         "name": tool_name,
         "description": "Process a refund request (demo tool).",
@@ -61,9 +53,6 @@ def tool_schema(tool_name: str) -> Dict[str, Any]:
 
 
 def cedar_policy_text(refund_limit: int, tool_name: str) -> str:
-    # NOTE: Cedar syntax can vary by example. The key point is:
-    # - enforce based on an attribute (amount) and the tool action.
-    # We keep it simple: allow the tool only when amount <= limit.
     return f"""
 permit (
   principal,
@@ -76,25 +65,44 @@ when {{
 """.strip()
 
 
-def create_gateway(ac, name: str, role_arn: str) -> Dict[str, Any]:
-    # This matches the “create gateway” behavior you already saw succeed.
-    resp = ac.create_gateway(
+def create_gateway(ac, name: str, role_arn: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Your account requires authorizerType for MCP gateways.
+    Start with authorizer_type=NONE in config.json.
+    If your account requires JWT, set authorizer_type=JWT and add jwt_issuer/jwt_audience.
+    """
+    auth_type = (cfg.get("authorizer_type") or "NONE").upper()
+
+    req = dict(
         name=name,
         description="MCP Gateway for AgentCore policy E2E test",
         roleArn=role_arn,
         clientToken=str(uuid.uuid4()),
         protocolType="MCP",
+        authorizerType=auth_type,  # ✅ REQUIRED (fixes your current error)
     )
-    return resp
+
+    if auth_type == "JWT":
+        issuer = cfg["jwt_issuer"]
+        audience = cfg["jwt_audience"]
+        req["authorizerConfiguration"] = {
+            "jwt": {
+                "issuer": issuer,
+                "audience": [audience] if isinstance(audience, str) else audience,
+            }
+        }
+
+    return ac.create_gateway(**req)
 
 
-def wait_gateway_ready(ac, gateway_arn: str, timeout_s: int = 120) -> None:
+def wait_gateway_ready(ac, gateway_arn: str, timeout_s: int = 180) -> Dict[str, Any]:
     t0 = time.time()
+    last = None
     while True:
-        r = ac.get_gateway(gatewayArn=gateway_arn)
-        status = r.get("status")
+        last = ac.get_gateway(gatewayArn=gateway_arn)
+        status = last.get("status")
         if status in ("READY", "ACTIVE"):
-            return
+            return last
         if time.time() - t0 > timeout_s:
             raise SystemExit(f"Gateway did not become READY in {timeout_s}s. Last status={status}")
         time.sleep(3)
@@ -109,14 +117,9 @@ def try_create_gateway_target(
     refund_limit: int,
 ) -> Dict[str, Any]:
     """
-    Your environment shows:
-    - policyEngineConfiguration exists on CreateGatewayTarget
-    - but CreatePolicyEngine doesn't accept policy content
-    So we attach policy inline at target creation.
-
-    Because SDK models vary, we try a few shapes.
+    We attempt two inline-policy shapes because accounts differ.
+    We DO NOT send credentialProvider anywhere.
     """
-
     ts = tool_schema(tool_name)
     cedar = cedar_policy_text(refund_limit, tool_name)
 
@@ -138,42 +141,22 @@ def try_create_gateway_target(
                 "toolSchema": ts,
             }
         },
-        # IMPORTANT: do NOT include credentialProvider anywhere.
-        # Your errors show that field is not allowed.
     )
 
-    # Variant A: policyEngineConfiguration with INLINE arn + cedar bundle
+    # Variant A
     variant_a = dict(base_req)
     variant_a["policyEngineConfiguration"] = {
         "arn": "INLINE",
         "mode": "ENFORCE",
-        "cedar": {
-            "policies": [
-                {"policyId": "refund-policy", "policyContent": cedar}
-            ]
-        },
+        "cedar": {"policies": [{"policyId": "refund-policy", "policyContent": cedar}]},
     }
 
-    # Variant B: policyEngineConfiguration without arn (some models require only mode + cedar)
+    # Variant B
     variant_b = dict(base_req)
     variant_b["policyEngineConfiguration"] = {
         "mode": "ENFORCE",
-        "cedar": {
-            "policies": [
-                {"policyId": "refund-policy", "policyContent": cedar}
-            ]
-        },
+        "cedar": {"policies": [{"policyId": "refund-policy", "policyContent": cedar}]},
     }
-
-    # Variant C: policyEngineConfiguration only references arn/mode (if inline policy not supported)
-    # (You would then need an existing policy engine ARN in config. This is a fallback.)
-    variant_c = dict(base_req)
-    pe_arn = None
-    # allow either policy_engine_arn or policyEngineArn in config if you add it later
-    # but we won’t require it now
-    # If missing, we skip this variant.
-    # (kept for future)
-    # variant_c["policyEngineConfiguration"] = {"arn": pe_arn, "mode": "ENFORCE"}
 
     attempts = [
         ("A (INLINE arn + cedar.policies)", variant_a),
@@ -184,34 +167,21 @@ def try_create_gateway_target(
     for label, req in attempts:
         try:
             print(f"[2/3] Creating Gateway Target using policy variant {label} ...")
-            resp = ac.create_gateway_target(**req)
-            return resp
+            return ac.create_gateway_target(**req)
         except (ParamValidationError, ClientError) as e:
             last_err = e
-            msg = str(e)
-            print(f"  -> Variant {label} failed.")
-            # helpful prints (short)
-            if "Unknown parameter" in msg or "Parameter validation failed" in msg:
-                print("     (SDK model mismatch on policy fields; trying next variant)")
-            else:
-                print(f"     {msg[:400]}")
+            print(f"  -> Variant {label} failed: {str(e)[:350]}")
             continue
 
-    # If we got here, none worked.
     raise SystemExit(
-        "\nNone of the inline policy variants worked in your environment.\n"
-        "This usually means your account/SDK requires an existing Policy Engine ARN.\n"
-        "If you can obtain a pre-created policy engine ARN from your platform team, add it to config.json as:\n"
-        '  "policy_engine_arn": "arn:aws:bedrock-agentcore:...:policy-engine/..." \n'
-        "and I’ll give you the exact single-call Target config for that.\n"
+        "\nGateway created, but Target creation failed for both inline policy shapes.\n"
+        "This usually means your account requires a pre-created Policy Engine ARN (docs path).\n"
         f"\nLast error: {last_err}\n"
     )
 
 
 def main():
     cfg = load_config()
-
-    # REQUIRED config keys
     region = cfg["region"]
     gateway_role = cfg["gateway_service_role_arn"]
     existing_lambda_arn = cfg["existing_lambda_arn"]
@@ -228,24 +198,29 @@ def main():
     ac = boto3.client("bedrock-agentcore-control", region_name=region)
 
     print(f"[1/3] Creating Gateway: {gateway_name}")
-    gw_resp = create_gateway(ac, gateway_name, gateway_role)
+    gw_resp = create_gateway(ac, gateway_name, gateway_role, cfg)
 
     gateway_arn = gw_resp.get("gatewayArn") or gw_resp.get("arn")
-    gateway_endpoint = gw_resp.get("gatewayEndpoint") or gw_resp.get("endpoint") or gw_resp.get("url")
-
     if not gateway_arn:
-        # print full response for debugging
         print("CreateGateway response:\n", json.dumps(gw_resp, indent=2, default=str))
         raise SystemExit("Could not find gatewayArn in CreateGateway response.")
 
-    # wait until READY
-    wait_gateway_ready(ac, gateway_arn)
-    # re-fetch to get endpoint if needed
-    gw_get = ac.get_gateway(gatewayArn=gateway_arn)
-    gateway_endpoint = gateway_endpoint or gw_get.get("gatewayEndpoint") or gw_get.get("endpoint") or gw_get.get("url")
+    gw_get = wait_gateway_ready(ac, gateway_arn)
+    endpoint = (
+        gw_resp.get("gatewayEndpoint")
+        or gw_get.get("gatewayEndpoint")
+        or gw_resp.get("endpoint")
+        or gw_get.get("endpoint")
+        or gw_resp.get("url")
+        or gw_get.get("url")
+    )
 
-    if gateway_endpoint:
-        print(f"Gateway READY: {gateway_endpoint}")
+    print(f"Gateway status: {gw_get.get('status')}")
+    if endpoint:
+        if str(endpoint).endswith("/mcp"):
+            print(f"MCP URL: {endpoint}")
+        else:
+            print(f"MCP URL: {endpoint}/mcp")
     else:
         print("Gateway READY (endpoint not returned by this SDK response).")
 
@@ -261,13 +236,10 @@ def main():
     target_arn = target_resp.get("targetArn") or target_resp.get("arn")
     print("\n[3/3] DONE")
     print(f"Gateway ARN : {gateway_arn}")
-    if gateway_endpoint:
-        print(f"MCP URL     : {gateway_endpoint}/mcp" if not str(gateway_endpoint).endswith("/mcp") else f"MCP URL     : {gateway_endpoint}")
     print(f"Target ARN  : {target_arn}")
 
     print("\nNext step:")
-    print(" - Run your runtime deploy / invoke scripts (deploy_runtime_jwt.py, invoke_runtime_jwt.py) as you planned.")
-    print(" - For policy proof: invoke tool with amount <= limit (allowed) and > limit (denied).")
+    print("Run your runtime deploy/invoke scripts and test amounts <= limit (allow) and > limit (deny).")
 
 
 if __name__ == "__main__":
