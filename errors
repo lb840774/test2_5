@@ -1,15 +1,65 @@
-import boto3, json
+import json
 
-c = boto3.client("bedrock-agentcore-control", region_name="us-east-1")
-op = c.meta.service_model.operation_model("CreateGateway")
-inp = op.input_shape
+def _resp(event, result=None, error=None):
+    # JSON-RPC response
+    base = {
+        "jsonrpc": "2.0",
+        "id": event.get("id"),
+    }
+    if error:
+        base["error"] = error
+    else:
+        base["result"] = result
+    return base
 
-def dump(shape, depth=0, max_depth=6):
-    out = {"type": shape.type_name}
-    if hasattr(shape, "required_members"):
-        out["required"] = list(shape.required_members)
-    if hasattr(shape, "members") and shape.members:
-        out["members"] = {k: dump(v, depth+1, max_depth) for k,v in shape.members.items()}
-    return out
+def lambda_handler(event, context):
+    # Gateway sends JSON-RPC
+    method = event.get("method")
+    params = event.get("params", {}) or {}
 
-print(json.dumps(dump(inp), indent=2)[:8000])
+    # 1) tools/list
+    if method == "tools/list":
+        return _resp(event, {
+            "tools": [
+                {
+                    "name": "process_refund",
+                    "description": "Process a refund request",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "amount": {"type": "integer", "description": "Refund amount"},
+                            "reason": {"type": "string", "description": "Reason for refund"}
+                        },
+                        "required": ["amount", "reason"]
+                    }
+                }
+            ]
+        })
+
+    # 2) tools/call
+    if method == "tools/call":
+        name = params.get("name")
+        arguments = params.get("arguments") or {}
+
+        if name != "process_refund":
+            return _resp(event, error={"code": -32601, "message": f"Unknown tool: {name}"})
+
+        amount = arguments.get("amount")
+        reason = arguments.get("reason")
+
+        return _resp(event, {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps({
+                        "status": "OK",
+                        "amount": amount,
+                        "reason": reason,
+                        "message": "Refund processed"
+                    })
+                }
+            ]
+        })
+
+    # Anything else
+    return _resp(event, error={"code": -32601, "message": f"Unknown method: {method}"})
