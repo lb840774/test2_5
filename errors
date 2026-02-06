@@ -1,13 +1,15 @@
-t = ac.create_gateway_target(
-    gatewayIdentifier=gateway_id,
-    name=target_name,
-    description="Refund tool target backed by existing Lambda",
-    targetConfiguration={
-        "mcp": {
-            "lambda": {
-                "lambdaArn": lambda_arn,
-                "toolSchema": {"inlinePayload": tool_schema}
-            }
-        }
-    }
-)
+import boto3, json
+
+c = boto3.client("bedrock-agentcore-control", region_name="us-east-1")
+op = c.meta.service_model.operation_model("CreateGateway")
+inp = op.input_shape
+
+def dump(shape, depth=0, max_depth=6):
+    out = {"type": shape.type_name}
+    if hasattr(shape, "required_members"):
+        out["required"] = list(shape.required_members)
+    if hasattr(shape, "members") and shape.members:
+        out["members"] = {k: dump(v, depth+1, max_depth) for k,v in shape.members.items()}
+    return out
+
+print(json.dumps(dump(inp), indent=2)[:8000])
