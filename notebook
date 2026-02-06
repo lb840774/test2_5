@@ -1,24 +1,22 @@
 import requests, json
 
-GATEWAY_URL = "https://poc-refund-test-jkvxhvn06a.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
+GATEWAY_URL = "https://YOUR-GATEWAY-HOSTNAME.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
 
-def mcp(method, params=None, id=1):
-    payload = {"jsonrpc": "2.0", "id": id, "method": method}
+def mcp(method, params=None, _id=1):
+    payload = {"jsonrpc":"2.0", "id": _id, "method": method}
     if params is not None:
-        payload["params"] = params  # <-- must be exactly this
+        payload["params"] = params
     r = requests.post(GATEWAY_URL, json=payload, timeout=30)
     print("HTTP", r.status_code)
     print("RAW:", r.text)
-    try:
-        return r.json()
-    except Exception:
-        return None
+    return r.json()
 
-tools_resp = mcp("tools/list", {}, id=1)
+tools_resp = mcp("tools/list", _id=1)
 
-# Grab the actual tool name the gateway wants (usually target-...__process_refund)
+# IMPORTANT: use the gateway-returned tool name (often prefixed)
 tool_name = tools_resp["result"]["tools"][0]["name"]
 print("TOOL NAME FROM GATEWAY:", tool_name)
+
 
 
 
@@ -30,20 +28,13 @@ call_resp = mcp(
     "tools/call",
     {
         "name": tool_name,
-        "arguments": {"amount": 25, "reason": "damaged item"},
         "input": {"amount": 25, "reason": "damaged item"},
+        "arguments": {"amount": 25, "reason": "damaged item"},
     },
-    id=2
+    _id=2
 )
 
 print("PARSED:", json.dumps(call_resp, indent=2))
 
 
-CELL 3
-
-if call_resp and "result" in call_resp:
-    print("RESULT CONTENT:", call_resp["result"].get("content"))
-    print("IS ERROR:", call_resp["result"].get("isError"))
-if call_resp and "error" in call_resp:
-    print("TOP-LEVEL ERROR:", call_resp["error"])
 
