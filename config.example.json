@@ -8,5 +8,13 @@
   "gateway_name_prefix": "policy-gateway",
   "lambda_function_name_prefix": "RefundTool",
   "target_name": "RefundTarget",
-  "tool_name": "process_refund"
+  "tool_name": "process_refund",
+
+  "runtime_exec_role_arn": "arn:aws:iam::<acct-id>:role/<existing-agentcore-runtime-exec-role>",
+  "runtime_code_s3_bucket": "<existing-bucket-you-can-write-to>",
+  "runtime_code_s3_prefix": "agentcore/runtime-artifacts/policy-agent",
+  "runtime_name_prefix": "policy-agent-runtime",
+  "runtime_endpoint_name": "policy-agent-endpoint",
+  "runtime_network_mode": "PUBLIC"
 }
+
