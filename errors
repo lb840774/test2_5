@@ -1,5 +1,4 @@
 import json
-import os
 
 def _j(obj):
     return json.dumps(obj, default=str)
@@ -13,38 +12,49 @@ def _try_json(x):
     return x
 
 def _resp(req, result=None, error=None):
-    # Return JSON-RPC style response if possible; otherwise still return same shape
-    return {
-        "jsonrpc": req.get("jsonrpc", "2.0") if isinstance(req, dict) else "2.0",
-        "id": req.get("id") if isinstance(req, dict) else None,
-        **({"result": result} if error is None else {"error": error})
-    }
+    base = {"jsonrpc": "2.0", "id": None}
+    if isinstance(req, dict):
+        base["jsonrpc"] = req.get("jsonrpc", "2.0")
+        base["id"] = req.get("id")
+    if error is None:
+        base["result"] = result
+    else:
+        base["error"] = error
+    return base
 
-def _extract_method_and_params(event):
-    """
-    Event can arrive as:
-    1) {"jsonrpc":"2.0","id":...,"method":"tools/call","params":{...}}
-    2) {"method":"tools/call","params":{...}}
-    3) {"params":{...}} (rare)
-    4) already the params dict itself (rare) -> {"amount":25,"reason":"x"}
-    """
+def _infer_method(evt: dict):
+    # If the gateway sends non-JSON-RPC events
+    # tools/list often looks like {"tools": ...} or sometimes nothing but request intent
+    if "tools" in evt and isinstance(evt.get("tools"), list):
+        return "tools/list"
+
+    # tools/call often looks like {"name": "...", "arguments": {...}} or {"name": "...", "input": {...}}
+    if "name" in evt and ("arguments" in evt or "input" in evt or "toolName" in evt):
+        return "tools/call"
+
+    # If it looks like ONLY tool input (amount/reason) assume tools/call for single-tool targets
+    if "amount" in evt or "reason" in evt:
+        return "tools/call"
+
+    return None
+
+def _extract_req_method_params(event):
     evt = _try_json(event)
-
     if not isinstance(evt, dict):
         return {}, None, {}
 
     method = evt.get("method")
     params = evt.get("params")
 
-    # Sometimes params is a JSON string
     params = _try_json(params)
 
-    # If params is missing but event looks like params itself
-    if params is None and ("amount" in evt or "reason" in evt or "name" in evt or "arguments" in evt or "input" in evt):
-        params = evt
+    # If no JSON-RPC method, infer based on payload shape
+    if not method:
+        method = _infer_method(evt)
 
+    # If params missing, treat event itself as params for non-JSON-RPC shapes
     if params is None:
-        params = {}
+        params = evt
 
     if not isinstance(params, dict):
         params = {}
@@ -52,36 +62,23 @@ def _extract_method_and_params(event):
     return evt, method, params
 
 def _extract_tool_name(params):
-    # Common shapes:
-    # params = {"name": "...", "arguments": {...}}
-    # params = {"tool": {"name": "..."}, "arguments": {...}}
-    name = params.get("name")
-
+    name = params.get("name") or params.get("toolName")
     tool = params.get("tool")
     if not name and isinstance(tool, dict):
         name = tool.get("name")
-
-    # Some clients might put toolName
-    if not name:
-        name = params.get("toolName")
-
     return name
 
 def _extract_tool_input(params):
-    # Prefer arguments; fallback to input
-    arguments = params.get("arguments")
-    if arguments is None:
-        arguments = params.get("input")
-
-    arguments = _try_json(arguments)
-
-    if arguments is None:
-        arguments = {}
-
-    if not isinstance(arguments, dict):
-        arguments = {}
-
-    return arguments
+    args = params.get("arguments")
+    if args is None:
+        args = params.get("input")
+    args = _try_json(args)
+    if args is None:
+        # Sometimes the params is already the input dict
+        args = {}
+    if not isinstance(args, dict):
+        args = {}
+    return args
 
 def _is_refund_tool(name: str) -> bool:
     if not name:
@@ -92,7 +89,7 @@ def lambda_handler(event, context):
     print("=== RAW EVENT ===")
     print(_j(event))
 
-    req, method, params = _extract_method_and_params(event)
+    req, method, params = _extract_req_method_params(event)
 
     print("=== PARSED ===")
     print("method:", method)
@@ -122,15 +119,13 @@ def lambda_handler(event, context):
         tool_name = _extract_tool_name(params)
         tool_input = _extract_tool_input(params)
 
+        # If gateway stripped name but params look like input, assume single tool
+        if not tool_name and ("amount" in params or "reason" in params):
+            tool_name = "process_refund"
+            tool_input = {**params}
+
         print("tool_name:", tool_name)
         print("tool_input:", _j(tool_input))
-
-        # If gateway/client stripped name, but we only have one tool, assume refund tool
-        if not tool_name:
-            # This matches your current error case: params becomes {"amount":25,"reason":"..."}
-            if "amount" in params or "reason" in params:
-                tool_input = {**params}
-                tool_name = "process_refund"
 
         if not _is_refund_tool(tool_name):
             return _resp(req, error={"code": -32601, "message": f"Unknown tool: {tool_name}"})
@@ -141,7 +136,7 @@ def lambda_handler(event, context):
         if amount is None or reason is None:
             return _resp(req, error={
                 "code": -32602,
-                "message": f"Missing required fields: amount={amount}, reason={reason}",
+                "message": "Missing required fields (amount, reason)",
                 "seen": {"tool_name": tool_name, "tool_input": tool_input, "params": params}
             })
 
@@ -159,5 +154,4 @@ def lambda_handler(event, context):
             ]
         })
 
-    # anything else
-    return _resp(req if isinstance(req, dict) else {}, error={"code": -32601, "message": f"Unknown method: {method}"})
+    return _resp(req, error={"code": -32601, "message": f"Unknown method: {method}"})
