@@ -1,149 +1,28 @@
-import json
+import json, requests
 
-def _try_json(x):
-    if isinstance(x, str):
-        s = x.strip()
-        if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
-            try:
-                return json.loads(s)
-            except Exception:
-                return x
-    return x
+GATEWAY_URL = "https://poc-refund-test-jkvxhvno6a.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
 
-def _resp(req, result=None, error=None):
-    base = {"jsonrpc": "2.0", "id": req.get("id")}
-    if error is not None:
-        base["error"] = error
-    else:
-        base["result"] = result or {}
-    return base
+def mcp(method, params=None, id=1):
+    payload = {
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method
+    }
+    if params is not None:
+        payload["params"] = params
 
-def _normalize_req(event):
-    # Common wrappers: body string, EventBridge detail, direct dict
-    if isinstance(event, dict):
-        if "body" in event and isinstance(event["body"], str):
-            parsed = _try_json(event["body"])
-            if isinstance(parsed, dict):
-                return parsed
-        if "detail" in event and isinstance(event["detail"], dict):
-            # Sometimes the real payload is under detail
-            return event["detail"]
-    return event if isinstance(event, dict) else {}
+    r = requests.post(GATEWAY_URL, json=payload, timeout=30)
 
-def _find_first_tool_input(obj):
-    """
-    Search for a dict that looks like tool input:
-    - has keys like amount/reason
-    - or is under known keys arguments/input/payload
-    """
-    if isinstance(obj, dict):
-        # Known keys first
-        for k in ("arguments", "input", "payload"):
-            if k in obj:
-                v = _try_json(obj[k])
-                if isinstance(v, dict):
-                    return v
+    print("\n=== HTTP STATUS ===")
+    print(r.status_code)
 
-        # If this dict itself looks like the input
-        if "amount" in obj or "reason" in obj:
-            return obj
+    print("\n=== RAW RESPONSE TEXT ===")
+    print(r.text)
 
-        # Otherwise recurse
-        for v in obj.values():
-            found = _find_first_tool_input(_try_json(v))
-            if isinstance(found, dict) and (found != {}):
-                if "amount" in found or "reason" in found:
-                    return found
+    print("\n=== PARSED JSON ===")
+    try:
+        print(json.dumps(r.json(), indent=2))
+    except Exception as e:
+        print("Not JSON:", e)
 
-    elif isinstance(obj, list):
-        for item in obj:
-            found = _find_first_tool_input(_try_json(item))
-            if isinstance(found, dict) and (found != {}):
-                if "amount" in found or "reason" in found:
-                    return found
-
-    return {}
-
-def _is_refund_tool(name: str) -> bool:
-    if not name:
-        return False
-    return name == "process_refund" or name.endswith("__process_refund")
-
-def lambda_handler(event, context):
-    # Normalize request for JSON-RPC
-    req = _normalize_req(event)
-
-    # If gateway didn’t include jsonrpc fields, we still want to see it
-    if not isinstance(req, dict):
-        req = {}
-
-    method = req.get("method")
-    params = req.get("params") or {}
-    params = _try_json(params)
-
-    # tools/list
-    if method == "tools/list":
-        return _resp(req, result={
-            "tools": [{
-                "name": "process_refund",
-                "description": "Process a refund request",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "amount": {"type": "integer"},
-                        "reason": {"type": "string"},
-                    },
-                    "required": ["amount", "reason"]
-                }
-            }]
-        })
-
-    # tools/call
-    if method == "tools/call":
-        name = None
-        if isinstance(params, dict):
-            name = params.get("name")
-
-        if not _is_refund_tool(name):
-            return _resp(req, error={"code": -32601, "message": f"Unknown tool: {name}", "debug": {"params": params}})
-
-        tool_input = _find_first_tool_input(params)
-
-        amount = tool_input.get("amount")
-        reason = tool_input.get("reason")
-
-        missing = []
-        if amount is None: missing.append("amount")
-        if reason is None: missing.append("reason")
-
-        if missing:
-            # Return what we actually received so you can see it in the notebook output
-            return _resp(req, error={
-                "code": -32602,
-                "message": f"Missing required field(s): {', '.join(missing)}",
-                "debug": {
-                    "tool_name_received": name,
-                    "params_received": params,
-                    "tool_input_extracted": tool_input,
-                    "top_level_event_keys": list(event.keys()) if isinstance(event, dict) else str(type(event))
-                }
-            })
-
-        return _resp(req, result={
-            "content": [{
-                "type": "text",
-                "text": json.dumps({
-                    "status": "OK",
-                    "amount": amount,
-                    "reason": reason,
-                    "message": "Refund processed"
-                })
-            }]
-        })
-
-    # Unknown / not JSON-RPC shaped
-    return _resp(req, error={
-        "code": -32601,
-        "message": f"Unknown method: {method}",
-        "debug": {"normalized_req": req, "raw_event_type": str(type(event))}
-    })
+    return r
