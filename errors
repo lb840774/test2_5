@@ -1,15 +1,23 @@
-import pkgutil
-import bedrock_agentcore_starter_toolkit as b
+t = ac.create_gateway_target(
+    gatewayIdentifier=gateway_id,
+    name=target_name,
+    description="Refund tool target backed by existing Lambda",
+    targetConfiguration={
+        "mcp": {
+            "lambda": {
+                "lambdaArn": lambda_arn,
 
-mods = [m.name for m in pkgutil.walk_packages(b.__path__, b.__name__ + ".")]
-print("Toolkit module count:", len(mods))
+                # ✅ THIS IS THE MISSING PIECE
+                "credentialProvider": {
+                    "assumeRole": {
+                        "roleArn": gateway_service_role_arn
+                    }
+                },
 
-# show anything that looks related to gateway/policy/runtime
-keywords = ["policy", "gateway", "runtime", "cedar", "auth", "cognito"]
-for k in keywords:
-    hits = [m for m in mods if k in m.lower()]
-    print("\n==", k, "==")
-    for m in hits[:80]:
-        print(m)
-    if len(hits) > 80:
-        print(f"... +{len(hits)-80} more")
+                "toolSchema": {
+                    "inlinePayload": tool_schema
+                }
+            }
+        }
+    }
+)
