@@ -1,3 +1,6 @@
+1. Model package is Approved
+
+A human or automated governance step marks the model package as Approved.
 2. Deployment request JSON is produced
 
 A deployment app / pipeline creates a JSON payload:
