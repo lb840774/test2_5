@@ -1,420 +1,99 @@
-cell1: 
-import requests, json, time, uuid, os
+import os, json, uuid
 import boto3
 from botocore.exceptions import ClientError
 
-# Paste your existing Gateway MCP endpoint (you already have this)
-GATEWAY_URL = "https://poc-refund-test-jkvxhvn06a.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
-
-# Paste your Gateway ARN (from console or list call in AWS)
-GATEWAY_ARN = "PASTE_YOUR_GATEWAY_ARN_HERE"
-
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 sess = boto3.session.Session(region_name=REGION)
+
+# control-plane client
 ctrl = sess.client("bedrock-agentcore-control")
 
-def mcp(method, params=None, _id=1):
-    payload = {"jsonrpc":"2.0", "id": _id, "method": method}
-    if params is not None:
-        payload["params"] = params
-    r = requests.post(GATEWAY_URL, json=payload, timeout=30)
-    print("HTTP", r.status_code)
-    r.raise_for_status()
-    return r.json()
+# data-plane client (identity runtime calls)
+dp = sess.client("bedrock-agentcore")
 
-print("Region:", REGION)
-print("Gateway ARN:", GATEWAY_ARN)
+print("REGION:", REGION)
+print("control:", ctrl.meta.service_model.service_name)
+print("dataplane:", dp.meta.service_model.service_name)
 
-cell2:
-tools_resp = mcp("tools/list", _id=1)
-print(json.dumps(tools_resp, indent=2)[:2000])
 
-cell3:
-import uuid, time, json
-from botocore.exceptions import ClientError
 
-API_KEY_VALUE = "demo-secret"
+WORKLOAD_NAME = f"wid-nb-{uuid.uuid4().hex[:8]}"
 
 try:
-    resp = ctrl.create_api_key_credential_provider(
-        name=f"demo-apikey-{uuid.uuid4().hex[:8]}",
-        apiKey=API_KEY_VALUE
+    wid_resp = ctrl.create_workload_identity(
+        name=WORKLOAD_NAME,
+        description="Standalone workload identity for MCP Gateway + Lambda test"
     )
-
-    print("RAW RESPONSE:")
-    print(json.dumps(resp, indent=2, default=str))
-
-    # Try common locations for the ARN (handles SDK/shape differences)
-    APIKEY_PROVIDER_ARN = (
-        resp.get("apiKeyCredentialProviderArn")
-        or resp.get("apiKeyCredentialProviderARN")
-        or resp.get("credentialProviderArn")
-        or resp.get("arn")
-        or (resp.get("apiKeyCredentialProvider") or {}).get("arn")
-        or (resp.get("apiKeyCredentialProvider") or {}).get("apiKeyCredentialProviderArn")
-    )
-
-    if not APIKEY_PROVIDER_ARN:
-        raise KeyError(f"Could not find provider ARN in response keys: {list(resp.keys())}")
-
-    print("\n✅ APIKEY_PROVIDER_ARN:", APIKEY_PROVIDER_ARN)
-
+    print("✅ Created workload identity:", WORKLOAD_NAME)
+    print(json.dumps(wid_resp, indent=2, default=str)[:2000])
 except ClientError as e:
-    print("❌ AWS ClientError:")
-    print(e.response["Error"]["Code"], "-", e.response["Error"].get("Message"))
+    print("❌ create_workload_identity failed:", e.response["Error"]["Code"], e.response["Error"].get("Message"))
     raise
 
-cell4:
-import json
 
-# dp = sess.client("bedrock-agentcore")  # you already created this earlier
 
-api_key_resp = dp.get_resource_api_key(
-    resourceArn=APIKEY_PROVIDER_ARN
-)
+API_KEY_VALUE = "demo-secret-123"  # just a test value
+APIKEY_PROVIDER_NAME = f"demo-apikey-{uuid.uuid4().hex[:8]}"
 
-print("RAW get_resource_api_key response:")
-print(json.dumps(api_key_resp, indent=2, default=str))
+try:
+    pk_resp = ctrl.create_api_key_credential_provider(
+        name=APIKEY_PROVIDER_NAME,
+        apiKey=API_KEY_VALUE
+    )
+    print("✅ Created API key credential provider:", APIKEY_PROVIDER_NAME)
+    print(json.dumps(pk_resp, indent=2, default=str)[:2000])
+except ClientError as e:
+    print("❌ create_api_key_credential_provider failed:", e.response["Error"]["Code"], e.response["Error"].get("Message"))
+    raise
 
-API_KEY_FROM_IDENTITY = (
-    api_key_resp.get("apiKey")
-    or api_key_resp.get("value")
-    or (api_key_resp.get("resourceApiKey") or {}).get("apiKey")
-    or (api_key_resp.get("resourceApiKey") or {}).get("value")
-)
 
-if not API_KEY_FROM_IDENTITY:
-    raise KeyError(f"Could not find apiKey value in response keys: {list(api_key_resp.keys())}")
 
-print("\n✅ API_KEY_FROM_IDENTITY:", API_KEY_FROM_IDENTITY)
+print("=== COPY THESE INTO LAMBDA ENV VARS ===")
+print("AWS_REGION =", REGION)
+print("WORKLOAD_NAME =", WORKLOAD_NAME)
+print("APIKEY_PROVIDER_NAME =", APIKEY_PROVIDER_NAME)
+print("======================================")
 
-cell5:
+
+
+
+INVOKE: 
 import requests, json
 
-r = requests.get(
-    "https://httpbin.org/headers",
-    headers={"x-api-key": API_KEY_FROM_IDENTITY},
-    timeout=30
-)
-
-print("HTTP:", r.status_code)
-data = r.json()
-print(json.dumps(data, indent=2)[:2000])
-
-# Proof
-echoed = data.get("headers", {}).get("X-Api-Key")
-print("\n✅ Echoed X-Api-Key:", echoed)
-
-
-
-
-
-
-
-
-
-
-
-import boto3, os, inspect
-
-REGION = os.environ.get("AWS_REGION", "us-east-1")
-sess = boto3.session.Session(region_name=REGION)
-
-ctrl = sess.client("bedrock-agentcore-control")
-dp   = sess.client("bedrock-agentcore")  # data-plane-ish client in many setups
-
-def show_methods(client, contains):
-    methods = [m for m in dir(client) if contains in m.lower()]
-    print(client.meta.service_model.service_name, "->", methods)
-
-show_methods(ctrl, "api")
-show_methods(ctrl, "key")
-show_methods(dp, "api")
-show_methods(dp, "key")
-
-
-
-
-
-
-
--------------
-s0: 
-import boto3, os, uuid, json
-
-REGION = os.environ.get("AWS_REGION", "us-east-1")
-sess = boto3.session.Session(region_name=REGION)
-ctrl = sess.client("bedrock-agentcore-control")
-
-API_KEY_VALUE = "demo-secret"
-PROVIDER_NAME = f"demo-apikey-{uuid.uuid4().hex[:8]}"
-
-resp = ctrl.create_api_key_credential_provider(
-    name=PROVIDER_NAME,
-    apiKey=API_KEY_VALUE
-)
-
-print("RAW:", json.dumps(resp, indent=2, default=str))
-print("\n✅ PROVIDER_NAME (save this):", PROVIDER_NAME)
-
-s1:
-wi = ctrl.list_workload_identities()
-import json
-print(json.dumps(wi, indent=2, default=str))
-
-
-cell1:
-import requests, json
-
-GATEWAY_URL = "PASTE_YOUR_GATEWAY_MCP_ENDPOINT"
+GATEWAY_URL = "PASTE_YOUR_GATEWAY_MCP_URL_HERE"  # e.g. https://xxxx.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp
 
 def mcp(method, params=None, _id=1):
-    payload = {"jsonrpc":"2.0", "id": _id, "method": method}
+    payload = {"jsonrpc": "2.0", "id": _id, "method": method}
     if params is not None:
         payload["params"] = params
     r = requests.post(GATEWAY_URL, json=payload, timeout=30)
     print("HTTP", r.status_code)
-    print("RAW", r.text[:500])  # short preview
+    print("RAW", r.text[:800])
     r.raise_for_status()
     return r.json()
 
-cell2: 
+
+
+
+
 tools_resp = mcp("tools/list", _id=1)
-print(json.dumps(tools_resp, indent=2)[:2000])
+print(json.dumps(tools_resp, indent=2)[:3000])
 
 tool_name = tools_resp["result"]["tools"][0]["name"]
-print("\n✅ TOOL NAME:", tool_name)
+print("✅ TOOL NAME:", tool_name)
 
-cell3: 
+
+
+
 call_resp = mcp(
     "tools/call",
     params={
-        "name": tool_name,
+        "name": "process_refund",
         "arguments": {"amount": 25, "reason": "damaged item"}
     },
     _id=2
 )
 
 print(json.dumps(call_resp, indent=2)[:4000])
-
-cell4: 
-text = call_resp["result"]["content"][0]["text"]
-payload = json.loads(text)
-
-print("Refund message:", payload.get("message"))
-print("Echoed X-Api-Key:", payload.get("identity_proof", {}).get("echoed_x_api_key_from_httpbin"))
-
-lambda:
-import json
-import os
-import urllib.request
-import boto3
-
-def _j(obj):
-    return json.dumps(obj, default=str)
-
-def _try_json(x):
-    if isinstance(x, str):
-        try:
-            return json.loads(x)
-        except Exception:
-            return x
-    return x
-
-def _resp(req, result=None, error=None):
-    base = {"jsonrpc": "2.0", "id": None}
-    if isinstance(req, dict):
-        base["jsonrpc"] = req.get("jsonrpc", "2.0")
-        base["id"] = req.get("id")
-    if error is None:
-        base["result"] = result
-    else:
-        base["error"] = error
-    return base
-
-def _infer_method(evt: dict):
-    if "tools" in evt and isinstance(evt.get("tools"), list):
-        return "tools/list"
-    if "name" in evt and ("arguments" in evt or "input" in evt or "toolName" in evt):
-        return "tools/call"
-    if "amount" in evt or "reason" in evt:
-        return "tools/call"
-    return None
-
-def _extract_req_method_params(event):
-    evt = _try_json(event)
-    if not isinstance(evt, dict):
-        return {}, None, {}
-    method = evt.get("method")
-    params = evt.get("params")
-    params = _try_json(params)
-    if not method:
-        method = _infer_method(evt)
-    if params is None:
-        params = evt
-    if not isinstance(params, dict):
-        params = {}
-    return evt, method, params
-
-def _extract_tool_name(params):
-    name = params.get("name") or params.get("toolName")
-    tool = params.get("tool")
-    if not name and isinstance(tool, dict):
-        name = tool.get("name")
-    return name
-
-def _extract_tool_input(params):
-    args = params.get("arguments")
-    if args is None:
-        args = params.get("input")
-    args = _try_json(args)
-    if args is None:
-        args = {}
-    if not isinstance(args, dict):
-        args = {}
-    return args
-
-def _is_refund_tool(name: str) -> bool:
-    if not name:
-        return False
-    return name == "process_refund" or name.endswith("__process_refund")
-
-def _get_identity_api_key():
-    """
-    Uses AgentCore Identity data plane:
-    1) get_workload_access_token(workloadName)
-    2) get_resource_api_key(workloadIdentityToken, resourceCredentialProviderName)
-    """
-    workload_name = os.environ["WORKLOAD_NAME"]
-    provider_name = os.environ["RESOURCE_CREDENTIAL_PROVIDER_NAME"]
-
-    dp = boto3.client("bedrock-agentcore")
-
-    tok = dp.get_workload_access_token(workloadName=workload_name)
-    wat = tok["workloadAccessToken"]
-
-    key_resp = dp.get_resource_api_key(
-        workloadIdentityToken=wat,
-        resourceCredentialProviderName=provider_name
-    )
-
-    api_key = key_resp.get("apiKey") or key_resp.get("value")
-    if not api_key:
-        raise RuntimeError(f"API key not found in response: {key_resp}")
-
-    return api_key
-
-def _call_httpbin_headers(api_key: str):
-    req = urllib.request.Request(
-        "https://httpbin.org/headers",
-        headers={"x-api-key": api_key, "user-agent": "agentcore-identity-test"},
-        method="GET",
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        body = resp.read().decode("utf-8")
-        return json.loads(body)
-
-def lambda_handler(event, context):
-    print("=== RAW EVENT ===")
-    print(_j(event))
-
-    req, method, params = _extract_req_method_params(event)
-
-    print("=== PARSED ===")
-    print("method:", method)
-    print("params:", _j(params))
-
-    # tools/list
-    if method == "tools/list":
-        return _resp(req, result={
-            "tools": [
-                {
-                    "name": "process_refund",
-                    "description": "Process a refund request (and prove AgentCore Identity -> external API auth).",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "amount": {"type": "integer", "description": "Refund amount"},
-                            "reason": {"type": "string", "description": "Reason for refund"}
-                        },
-                        "required": ["amount", "reason"]
-                    }
-                }
-            ]
-        })
-
-    # tools/call
-    if method == "tools/call":
-        tool_name = _extract_tool_name(params)
-        tool_input = _extract_tool_input(params)
-
-        print("tool_name:", tool_name)
-        print("tool_input:", _j(tool_input))
-
-        if not _is_refund_tool(tool_name):
-            return _resp(req, error={"code": -32601, "message": f"Unknown tool: {tool_name}"})
-
-        amount = tool_input.get("amount")
-        reason = tool_input.get("reason")
-
-        if amount is None or reason is None:
-            return _resp(req, error={
-                "code": -32602,
-                "message": "Missing required fields (amount, reason)",
-                "seen": {"tool_name": tool_name, "tool_input": tool_input}
-            })
-
-        # --- Identity + external call proof ---
-        try:
-            api_key = _get_identity_api_key()
-            httpbin = _call_httpbin_headers(api_key)
-            echoed = (httpbin.get("headers") or {}).get("X-Api-Key")
-        except Exception as e:
-            return _resp(req, error={"code": -32000, "message": f"Identity/external call failed: {str(e)}"})
-
-        # Return BOTH: the original refund response + proof fields
-        return _resp(req, result={
-            "content": [
-                {
-                    "type": "text",
-                    "text": json.dumps({
-                        "status": "OK",
-                        "amount": amount,
-                        "reason": reason,
-                        "message": "Refund processed",
-                        "identity_proof": {
-                            "echoed_x_api_key_from_httpbin": echoed,
-                            "httpbin_headers_sample": httpbin.get("headers", {})
-                        }
-                    })
-                }
-            ]
-        })
-
-    return _resp(req, error={"code": -32601, "message": f"Unknown method: {method}"})
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
