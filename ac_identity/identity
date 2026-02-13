@@ -1,0 +1,95 @@
+cell1: 
+import requests, json, time, uuid, os
+import boto3
+from botocore.exceptions import ClientError
+
+# Paste your existing Gateway MCP endpoint (you already have this)
+GATEWAY_URL = "https://poc-refund-test-jkvxhvn06a.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
+
+# Paste your Gateway ARN (from console or list call in AWS)
+GATEWAY_ARN = "PASTE_YOUR_GATEWAY_ARN_HERE"
+
+REGION = os.environ.get("AWS_REGION", "us-east-1")
+sess = boto3.session.Session(region_name=REGION)
+ctrl = sess.client("bedrock-agentcore-control")
+
+def mcp(method, params=None, _id=1):
+    payload = {"jsonrpc":"2.0", "id": _id, "method": method}
+    if params is not None:
+        payload["params"] = params
+    r = requests.post(GATEWAY_URL, json=payload, timeout=30)
+    print("HTTP", r.status_code)
+    r.raise_for_status()
+    return r.json()
+
+print("Region:", REGION)
+print("Gateway ARN:", GATEWAY_ARN)
+
+cell2:
+tools_resp = mcp("tools/list", _id=1)
+print(json.dumps(tools_resp, indent=2)[:2000])
+
+cell3:
+API_KEY_VALUE = "demo-secret"  # demo value; not a real secret
+
+try:
+    resp = ctrl.create_api_key_credential_provider(
+        name=f"demo-apikey-{uuid.uuid4().hex[:8]}",
+        apiKey=API_KEY_VALUE
+    )
+    APIKEY_PROVIDER_ARN = resp["apiKeyCredentialProviderArn"]
+    print("✅ Created Identity API key provider ARN:\n", APIKEY_PROVIDER_ARN)
+except ClientError as e:
+    print("❌ Failed to create Identity API key provider (permissions issue).")
+    print(e.response["Error"]["Code"], "-", e.response["Error"].get("Message"))
+    raise
+
+cell4:
+openapi = {
+  "openapi": "3.0.1",
+  "info": {"title": "HttpBin Headers", "version": "1.0"},
+  "servers": [{"url": "https://httpbin.org"}],
+  "paths": {
+    "/headers": {
+      "get": {
+        "operationId": "getHeaders",
+        "responses": {"200": {"description": "OK"}}
+      }
+    }
+  }
+}
+
+try:
+    target_resp = ctrl.create_gateway_target(
+        gatewayArn=GATEWAY_ARN,
+        name=f"httpbin-target-{uuid.uuid4().hex[:6]}",
+        targetConfiguration={"openApiSchema": {"schema": json.dumps(openapi)}},
+        outboundAuthConfiguration={
+            "apiKeyCredentialProviderArn": APIKEY_PROVIDER_ARN,
+            "apiKeyHeaderName": "x-api-key"
+        }
+    )
+    print("✅ Created Gateway target:\n", target_resp["gatewayTargetArn"])
+except ClientError as e:
+    print("❌ Failed to create gateway target (permissions or bad Gateway ARN).")
+    print(e.response["Error"]["Code"], "-", e.response["Error"].get("Message"))
+    raise
+
+cell5:
+tools_resp = mcp("tools/list", _id=2)
+tools = tools_resp["result"]["tools"]
+
+print("Tool names:")
+for t in tools:
+    print(" -", t["name"])
+
+cell5:
+HTTPBIN_TOOL_NAME = "PASTE_TOOL_NAME_FROM_CELL_5"
+
+call_resp = mcp(
+    "tools/call",
+    params={"name": HTTPBIN_TOOL_NAME, "arguments": {}},
+    _id=3
+)
+
+print(json.dumps(call_resp, indent=2)[:4000])
