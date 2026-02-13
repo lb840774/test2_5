@@ -3,8 +3,8 @@ import json
 import boto3
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
-WORKLOAD_NAME = os.environ.get("WORKLOAD_NAME")  # required
-APIKEY_PROVIDER_NAME = os.environ.get("APIKEY_PROVIDER_NAME")  # required
+WORKLOAD_NAME = os.environ.get("WORKLOAD_NAME")          # required (workload identity NAME)
+APIKEY_PROVIDER_NAME = os.environ.get("APIKEY_PROVIDER_NAME")  # required (credential provider NAME)
 
 dp = boto3.client("bedrock-agentcore", region_name=REGION)
 
@@ -43,75 +43,94 @@ def _extract_req(event):
     method = evt.get("method")
     params = evt.get("params")
 
-    # if it's not JSON-RPC style, infer tools/call when amount/reason present
+    # If it's not JSON-RPC style, infer tools/call when amount/reason present
     if not method:
         if "amount" in evt or "reason" in evt:
             return {"jsonrpc": "2.0", "id": None}, "tools/call", evt
-        # unknown
         return {"jsonrpc": "2.0", "id": None}, None, {}
 
     params = _try_json(params)
-    if params is None:
+    if params is None or not isinstance(params, dict):
         params = {}
-    if not isinstance(params, dict):
-        params = {}
+
     return evt, method, params
 
 def _get_workload_access_token():
     """
-    Calls whatever operation name your boto3 exposes.
-    We try a few likely shapes to avoid SDK drift.
+    Calls the Bedrock AgentCore Identity access token API via boto3.
+    SDK/model versions have drifted on param names, so we try a few.
     """
     if not WORKLOAD_NAME:
         raise RuntimeError("WORKLOAD_NAME env var not set")
 
-    # Try common method names (SDKs sometimes differ)
     candidates = [
         "get_workload_access_token",
         "getWorkloadAccessToken",
     ]
+
     last_err = None
     for fn in candidates:
         if hasattr(dp, fn):
-            try:
-                # Most common request shape:
-                # get_workload_access_token(workloadIdentityName=..., )
-                return getattr(dp, fn)(workloadIdentityName=WORKLOAD_NAME)
-            except TypeError:
-                # Alternate request shapes if needed
+            api = getattr(dp, fn)
+
+            # Try likely request shapes in the most probable order
+            for kwargs in [
+                {"workloadName": WORKLOAD_NAME},                 # <- you hit this requirement
+                {"workloadIdentityName": WORKLOAD_NAME},
+                {"workloadIdentityIdentifier": WORKLOAD_NAME},
+            ]:
                 try:
-                    return getattr(dp, fn)(workloadIdentityIdentifier=WORKLOAD_NAME)
+                    return api(**kwargs)
+                except TypeError as e:
+                    last_err = e
+                    continue
                 except Exception as e:
                     last_err = e
-            except Exception as e:
-                last_err = e
+                    continue
 
     raise RuntimeError(f"Could not call workload access token API via boto3. Last error: {last_err}")
 
 def _extract_token(token_resp: dict) -> str:
-    # Try common response keys
-    for k in ["workloadIdentityToken", "token", "accessToken"]:
-        if isinstance(token_resp, dict) and token_resp.get(k):
-            return token_resp[k]
-    # Sometimes nested
+    """
+    Token response key drift has been observed.
+    Your screenshots show `workloadAccessToken`.
+    """
+    keys = [
+        "workloadAccessToken",     # <- from your response
+        "workloadIdentityToken",
+        "accessToken",
+        "token",
+    ]
+
     if isinstance(token_resp, dict):
+        for k in keys:
+            v = token_resp.get(k)
+            if v:
+                return v
+
+        # Sometimes nested one level
         for v in token_resp.values():
             if isinstance(v, dict):
-                for k in ["workloadIdentityToken", "token", "accessToken"]:
-                    if v.get(k):
-                        return v[k]
-    raise RuntimeError(f"Could not find token in response: {token_resp}")
+                for k in keys:
+                    vv = v.get(k)
+                    if vv:
+                        return vv
+
+    raise RuntimeError(
+        f"Could not find token in response keys="
+        f"{list(token_resp.keys()) if isinstance(token_resp, dict) else type(token_resp)} "
+        f"resp={token_resp}"
+    )
 
 def _get_resource_api_key(workload_token: str) -> str:
     """
     get_resource_api_key expects:
-      - workloadIdentityToken
+      - workloadIdentityToken (or similar; service name suggests identity token)
       - resourceCredentialProviderName
     """
     if not APIKEY_PROVIDER_NAME:
         raise RuntimeError("APIKEY_PROVIDER_NAME env var not set")
 
-    # method name you saw in your notebook output
     if not hasattr(dp, "get_resource_api_key"):
         raise RuntimeError("boto3 client does not have get_resource_api_key()")
 
@@ -122,14 +141,16 @@ def _get_resource_api_key(workload_token: str) -> str:
 
     # Try response keys
     for k in ["apiKey", "value", "secret", "apiKeyValue"]:
-        if resp.get(k):
+        if isinstance(resp, dict) and resp.get(k):
             return resp[k]
+
     # Sometimes nested
-    for v in resp.values():
-        if isinstance(v, dict):
-            for k in ["apiKey", "value", "secret", "apiKeyValue"]:
-                if v.get(k):
-                    return v[k]
+    if isinstance(resp, dict):
+        for v in resp.values():
+            if isinstance(v, dict):
+                for k in ["apiKey", "value", "secret", "apiKeyValue"]:
+                    if v.get(k):
+                        return v[k]
 
     raise RuntimeError(f"Could not find API key value in get_resource_api_key response: {resp}")
 
@@ -174,7 +195,7 @@ def lambda_handler(event, context):
         amount = args.get("amount")
         reason = args.get("reason")
 
-        # If caller didn’t include tool name (common in flattened events), assume process_refund
+        # If caller didn’t include tool name, assume process_refund
         if not tool_name:
             tool_name = "process_refund"
 
@@ -186,11 +207,14 @@ def lambda_handler(event, context):
 
         try:
             token_resp = _get_workload_access_token()
+            print("=== WORKLOAD TOKEN RESP ===")
+            print(_j(token_resp))
+
             workload_token = _extract_token(token_resp)
 
             api_key_value = _get_resource_api_key(workload_token)
 
-            # Return a masked preview so you can prove it worked without leaking full secret
+            # Mask preview so you can prove success without leaking the full secret
             masked = api_key_value[:3] + "***" + api_key_value[-3:] if len(api_key_value) >= 8 else "***"
 
             return _resp(req, result={
