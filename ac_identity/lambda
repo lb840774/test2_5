@@ -3,9 +3,6 @@ import os
 import urllib.request
 import boto3
 
-# -------------------------
-# Helpers
-# -------------------------
 def _j(obj):
     return json.dumps(obj, default=str)
 
@@ -29,15 +26,12 @@ def _resp(req, result=None, error=None):
     return base
 
 def _infer_method(evt: dict):
-    # tools/list often looks like {"tools":[...]} or {"method":"tools/list"}
     if "tools" in evt and isinstance(evt.get("tools"), list):
         return "tools/list"
-    # tools/call often looks like {"name":"...", "arguments":{...}}
-    if ("name" in evt) or ("toolName" in evt) or ("tool" in evt):
-        if ("arguments" in evt) or ("input" in evt) or (isinstance(evt.get("tool"), dict)):
-            return "tools/call"
-    # heuristic: if it contains tool args, it's likely tools/call
+    # If it looks like only tool args, treat as tools/call for single-tool target
     if "amount" in evt or "reason" in evt:
+        return "tools/call"
+    if ("name" in evt) or ("toolName" in evt) or ("tool" in evt):
         return "tools/call"
     return None
 
@@ -47,14 +41,13 @@ def _extract_req_method_params(event):
         return {}, None, {}
 
     method = evt.get("method")
-    params = evt.get("params")
-    params = _try_json(params)
+    params = _try_json(evt.get("params"))
 
     if not method:
         method = _infer_method(evt)
 
+    # If params missing, treat whole event as params (your gateway does this)
     if params is None:
-        # if params missing, treat the whole evt as params for non-strict shapes
         params = evt
 
     if not isinstance(params, dict):
@@ -63,45 +56,20 @@ def _extract_req_method_params(event):
     return evt, method, params
 
 def _extract_tool_name(params):
-    """
-    Supports shapes:
-      A) {"name": "...", "arguments": {...}}
-      B) {"toolName": "...", "arguments": {...}}
-      C) {"tool": {"name":"..."}, "arguments": {...}}
-      D) {"tool": {"name":"...", "arguments": {...}}}
-      E) {"params": {...}} nested
-    """
     if not isinstance(params, dict):
         return None
-
-    # direct
     name = params.get("name") or params.get("toolName")
     if name:
         return name
-
-    # nested tool dict
     tool = params.get("tool")
     if isinstance(tool, dict):
-        name = tool.get("name") or tool.get("toolName")
-        if name:
-            return name
-
-    # nested params again
+        return tool.get("name") or tool.get("toolName")
     nested = params.get("params")
     if isinstance(nested, dict):
         return _extract_tool_name(nested)
-
     return None
 
 def _extract_tool_input(params):
-    """
-    Supports shapes:
-      A) {"arguments": {...}}
-      B) {"input": {...}}
-      C) {"tool": {"arguments": {...}}}
-      D) {"tool": {"input": {...}}}
-      E) nested params
-    """
     if not isinstance(params, dict):
         return {}
 
@@ -111,9 +79,7 @@ def _extract_tool_input(params):
 
     if args is None and isinstance(params.get("tool"), dict):
         t = params["tool"]
-        args = t.get("arguments")
-        if args is None:
-            args = t.get("input")
+        args = t.get("arguments") or t.get("input")
 
     if args is None and isinstance(params.get("params"), dict):
         return _extract_tool_input(params["params"])
@@ -126,23 +92,14 @@ def _extract_tool_input(params):
     return args
 
 def _is_refund_tool(name: str) -> bool:
-    # gateway often prefixes tool name with target id, but suffix stays "__process_refund"
     return bool(name) and (name == "process_refund" or name.endswith("__process_refund"))
 
-# -------------------------
-# Identity + external call
-# -------------------------
+# ---------- Identity helpers ----------
 def _get_identity_api_key():
-    """
-    Requires these Lambda env vars:
-      WORKLOAD_NAME
-      RESOURCE_CREDENTIAL_PROVIDER_NAME
-    """
     workload_name = os.environ["WORKLOAD_NAME"]
     provider_name = os.environ["RESOURCE_CREDENTIAL_PROVIDER_NAME"]
 
     dp = boto3.client("bedrock-agentcore")
-
     tok = dp.get_workload_access_token(workloadName=workload_name)
     wat = tok["workloadAccessToken"]
 
@@ -150,11 +107,9 @@ def _get_identity_api_key():
         workloadIdentityToken=wat,
         resourceCredentialProviderName=provider_name
     )
-
     api_key = key_resp.get("apiKey") or key_resp.get("value")
     if not api_key:
         raise RuntimeError(f"API key not found in response: {key_resp}")
-
     return api_key
 
 def _call_httpbin_headers(api_key: str):
@@ -167,9 +122,7 @@ def _call_httpbin_headers(api_key: str):
         body = resp.read().decode("utf-8")
         return json.loads(body)
 
-# -------------------------
-# Lambda handler
-# -------------------------
+# ---------- Lambda handler ----------
 def lambda_handler(event, context):
     print("=== RAW EVENT ===")
     print(_j(event))
@@ -190,8 +143,8 @@ def lambda_handler(event, context):
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "amount": {"type": "integer", "description": "Refund amount"},
-                            "reason": {"type": "string", "description": "Reason for refund"}
+                            "amount": {"type": "integer"},
+                            "reason": {"type": "string"}
                         },
                         "required": ["amount", "reason"]
                     }
@@ -204,20 +157,28 @@ def lambda_handler(event, context):
         tool_name = _extract_tool_name(params)
         tool_input = _extract_tool_input(params)
 
+        # ✅ IMPORTANT FIX:
+        # If gateway sends bare args like {"amount":25,"reason":"x"}, treat params as input.
+        if (not tool_input) and isinstance(params, dict) and ("amount" in params or "reason" in params):
+            tool_input = {k: params.get(k) for k in ["amount", "reason"] if k in params}
+
+        # If tool_name is missing, assume single-tool target is refund
+        if not tool_name:
+            tool_name = "process_refund"
+
         print("tool_name:", tool_name)
         print("tool_input:", _j(tool_input))
 
-        if not _is_refund_tool(tool_name):
+        if not _is_refund_tool(tool_name) and tool_name != "process_refund":
             return _resp(req, error={"code": -32601, "message": f"Unknown tool: {tool_name}"})
 
         amount = tool_input.get("amount")
         reason = tool_input.get("reason")
-
         if amount is None or reason is None:
             return _resp(req, error={
                 "code": -32602,
                 "message": "Missing required fields (amount, reason)",
-                "seen": {"tool_name": tool_name, "tool_input": tool_input}
+                "seen": {"tool_name": tool_name, "tool_input": tool_input, "params": params}
             })
 
         # Identity -> external API proof
