@@ -65,54 +65,45 @@ except ClientError as e:
     raise
 
 cell4:
-openapi = {
-  "openapi": "3.0.1",
-  "info": {"title": "HttpBin Headers", "version": "1.0"},
-  "servers": [{"url": "https://httpbin.org"}],
-  "paths": {
-    "/headers": {
-      "get": {
-        "operationId": "getHeaders",
-        "responses": {"200": {"description": "OK"}}
-      }
-    }
-  }
-}
+import json
 
-try:
-    target_resp = ctrl.create_gateway_target(
-        gatewayArn=GATEWAY_ARN,
-        name=f"httpbin-target-{uuid.uuid4().hex[:6]}",
-        targetConfiguration={"openApiSchema": {"schema": json.dumps(openapi)}},
-        outboundAuthConfiguration={
-            "apiKeyCredentialProviderArn": APIKEY_PROVIDER_ARN,
-            "apiKeyHeaderName": "x-api-key"
-        }
-    )
-    print("✅ Created Gateway target:\n", target_resp["gatewayTargetArn"])
-except ClientError as e:
-    print("❌ Failed to create gateway target (permissions or bad Gateway ARN).")
-    print(e.response["Error"]["Code"], "-", e.response["Error"].get("Message"))
-    raise
+# dp = sess.client("bedrock-agentcore")  # you already created this earlier
 
-cell5:
-tools_resp = mcp("tools/list", _id=2)
-tools = tools_resp["result"]["tools"]
-
-print("Tool names:")
-for t in tools:
-    print(" -", t["name"])
-
-cell5:
-HTTPBIN_TOOL_NAME = "PASTE_TOOL_NAME_FROM_CELL_5"
-
-call_resp = mcp(
-    "tools/call",
-    params={"name": HTTPBIN_TOOL_NAME, "arguments": {}},
-    _id=3
+api_key_resp = dp.get_resource_api_key(
+    resourceArn=APIKEY_PROVIDER_ARN
 )
 
-print(json.dumps(call_resp, indent=2)[:4000])
+print("RAW get_resource_api_key response:")
+print(json.dumps(api_key_resp, indent=2, default=str))
+
+API_KEY_FROM_IDENTITY = (
+    api_key_resp.get("apiKey")
+    or api_key_resp.get("value")
+    or (api_key_resp.get("resourceApiKey") or {}).get("apiKey")
+    or (api_key_resp.get("resourceApiKey") or {}).get("value")
+)
+
+if not API_KEY_FROM_IDENTITY:
+    raise KeyError(f"Could not find apiKey value in response keys: {list(api_key_resp.keys())}")
+
+print("\n✅ API_KEY_FROM_IDENTITY:", API_KEY_FROM_IDENTITY)
+
+cell5:
+import requests, json
+
+r = requests.get(
+    "https://httpbin.org/headers",
+    headers={"x-api-key": API_KEY_FROM_IDENTITY},
+    timeout=30
+)
+
+print("HTTP:", r.status_code)
+data = r.json()
+print(json.dumps(data, indent=2)[:2000])
+
+# Proof
+echoed = data.get("headers", {}).get("X-Api-Key")
+print("\n✅ Echoed X-Api-Key:", echoed)
 
 
 
