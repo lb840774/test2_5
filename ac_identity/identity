@@ -30,17 +30,37 @@ tools_resp = mcp("tools/list", _id=1)
 print(json.dumps(tools_resp, indent=2)[:2000])
 
 cell3:
-API_KEY_VALUE = "demo-secret"  # demo value; not a real secret
+import uuid, time, json
+from botocore.exceptions import ClientError
+
+API_KEY_VALUE = "demo-secret"
 
 try:
     resp = ctrl.create_api_key_credential_provider(
         name=f"demo-apikey-{uuid.uuid4().hex[:8]}",
         apiKey=API_KEY_VALUE
     )
-    APIKEY_PROVIDER_ARN = resp["apiKeyCredentialProviderArn"]
-    print("✅ Created Identity API key provider ARN:\n", APIKEY_PROVIDER_ARN)
+
+    print("RAW RESPONSE:")
+    print(json.dumps(resp, indent=2, default=str))
+
+    # Try common locations for the ARN (handles SDK/shape differences)
+    APIKEY_PROVIDER_ARN = (
+        resp.get("apiKeyCredentialProviderArn")
+        or resp.get("apiKeyCredentialProviderARN")
+        or resp.get("credentialProviderArn")
+        or resp.get("arn")
+        or (resp.get("apiKeyCredentialProvider") or {}).get("arn")
+        or (resp.get("apiKeyCredentialProvider") or {}).get("apiKeyCredentialProviderArn")
+    )
+
+    if not APIKEY_PROVIDER_ARN:
+        raise KeyError(f"Could not find provider ARN in response keys: {list(resp.keys())}")
+
+    print("\n✅ APIKEY_PROVIDER_ARN:", APIKEY_PROVIDER_ARN)
+
 except ClientError as e:
-    print("❌ Failed to create Identity API key provider (permissions issue).")
+    print("❌ AWS ClientError:")
     print(e.response["Error"]["Code"], "-", e.response["Error"].get("Message"))
     raise
 
