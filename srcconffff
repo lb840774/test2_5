@@ -1,172 +1,24 @@
-1. Model package is Approved
-
-A human or automated governance step marks the model package as Approved.
-2. Deployment request JSON is produced
-
-A deployment app / pipeline creates a JSON payload:
-
-model_package_arn
-
-deployment_type = realtime or batch
-
-environment (dev/test/prod)
-
-realtime: endpoint_name, instance_type, instance_count
-
-batch: job_name, instance_type, instance_count, input_s3_uri, output_s3_uri, content_type, etc.
-
-3. Deployment request is sent to SQS (Target Hosting account)
-
-The deployment app publishes the JSON to an SQS “DeploymentRequests” queue in the Target Hosting account.
-
-(Optional) SQS has a DLQ attached.
-
-B. SQS → Step Functions trigger
-
-4. SQS triggers a “StartDeployment” Lambda (Target Hosting account)
-
-Lambda is event-source mapped to SQS.
-
-For each message:
-
-validates schema minimally
-
-generates an idempotency key (or uses one in the payload)
-
-starts a Step Functions execution with the JSON as input
-
-only after successful StartExecution → deletes the message from SQS
-
-failures → message retries; after max receives → DLQ
-
-5. Step Functions execution begins (Target Hosting account)
-
-C. Step Functions orchestration (your purple workflow)
-
-6. CheckAccess (Lambda)
-
-Enforces controls:
-
-caller/app is allowed to deploy
-
-model package is Approved
-
-environment rules (prod stricter)
-
-allowed instance types/counts for env
-
-allowed endpoints naming/tagging
-
-If unauthorized:
-
-NotifyUnauthorized (SNS)
-
-end/fail workflow
-
-7. ResolveModelPackage (Lambda) — recommended explicit step
-
-Retrieves model package metadata (from registry) to get:
-
-model artifact S3 URI (source)
-
-container image URI (ECR)
-
-model package version / approval metadata
-
-any env vars stored in registry metadata/tags
-
-Output = fully resolved “what to deploy”
-
-8. CopyArtifacts (Lambda)
-
-Copies model artifacts from Control Plane S3 to Target Hosting S3 (or validates they already exist).
-
-Output includes:
-
-target_model_data_url (S3 URI in Target Hosting)
-
-image_uri (ECR URI)
-
-sagemaker_execution_role_arn to use in CreateModel
-
-kms_key_arn (if needed)
-
-vpc_config (subnets/SGs if VPC-only)
-
-9. ChooseDeploymentType (Choice state)
-
-If deployment_type == "realtime" → realtime branch
-
-Else if deployment_type == "batch" → batch branch
-
-D. Real-time branch
-
-10R. DeployRealtime (Lambda)
-
-Calls SageMaker in Target Hosting account:
-
-CreateModel (image_uri + target_model_data_url + execution role)
-
-CreateEndpointConfig
-
-CreateEndpoint or UpdateEndpoint
-
-11R. WaitForRealtimeDeployment (Wait)
-
-Sleep N seconds.
-
-12R. CheckRealtimeStatus (Lambda)
-
-DescribeEndpoint until:
-
-InService → success
-
-Failed → failure
-
-else → loop back to Wait
-
-13R. NotifyRealtimeSuccess (SNS)
-
-Publish success payload (endpoint name, model version, etc.)
-
-End workflow success
-
-14R. NotifyFailure (SNS) (if failed)
-
-Publish failure payload (error message)
-
-End workflow failure
-
-E. Batch branch
-
-10B. DeployBatch (Lambda)
-
-Calls SageMaker:
-
-CreateModel
-
-CreateTransformJob with input/output S3
-
-11B. WaitForBatchJob (Wait)
-
-12B. CheckBatchStatus (Lambda)
-
-DescribeTransformJob until:
-
-Completed → success
-
-Failed/Stopped → failure
-
-else → loop
-
-13B. NotifyBatchSuccess (SNS)
-
-Publish success payload (job name, output path, etc.)
-
-End workflow success
-
-14B. NotifyFailure (SNS) (if failed)
-
-Publish failure payload (error)
-
-End workflow failure
+{
+  "realtime_example": {
+    "app_id": "app-123",
+    "model_package_arn": "arn:aws:sagemaker:us-east-1:CONTROL_PLANE_ACCOUNT:model-package/my-model/1",
+    "deployment_type": "realtime",
+    "endpoint_name": "my-endpoint-prod",
+    "instance_type": "ml.m5.large",
+    "instance_count": 1,
+    "environment": "prod"
+  },
+  "batch_example": {
+    "app_id": "app-456",
+    "model_package_arn": "arn:aws:sagemaker:us-east-1:CONTROL_PLANE_ACCOUNT:model-package/my-model/1",
+    "deployment_type": "batch",
+    "job_name": "my-batch-job",
+    "instance_type": "ml.m5.xlarge",
+    "instance_count": 2,
+    "input_s3_uri": "s3://my-bucket/input/",
+    "output_s3_uri": "s3://my-bucket/output/",
+    "content_type": "text/csv",
+    "split_type": "Line",
+    "environment": "prod"
+  }
+}
