@@ -113,3 +113,31 @@ call_resp = mcp(
 )
 
 print(json.dumps(call_resp, indent=2)[:4000])
+
+
+
+
+
+
+
+
+
+
+
+import boto3, os, inspect
+
+REGION = os.environ.get("AWS_REGION", "us-east-1")
+sess = boto3.session.Session(region_name=REGION)
+
+ctrl = sess.client("bedrock-agentcore-control")
+dp   = sess.client("bedrock-agentcore")  # data-plane-ish client in many setups
+
+def show_methods(client, contains):
+    methods = [m for m in dir(client) if contains in m.lower()]
+    print(client.meta.service_model.service_name, "->", methods)
+
+show_methods(ctrl, "api")
+show_methods(ctrl, "key")
+show_methods(dp, "api")
+show_methods(dp, "key")
+
