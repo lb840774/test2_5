@@ -1,147 +1,60 @@
-What we tested (E2E)
-Goal
+Process flow we executed (end-to-end)
 
-Validate that Bedrock AgentCore Tools & Gateways (MCP Gateway) can:
+Created a Workload Identity (WI)
 
-expose a “tool” via a target (Lambda), and
+We created a standalone workload identity in AgentCore Identity (this is the “who is calling” identity the runtime will use).
 
-allow a client (Jupyter notebook) to discover and invoke that tool through the gateway.
+Created an Outbound Auth API Key provider
 
-Components we set up
+We stored a test API key value in AgentCore Identity as an “API key credential provider” (this represents a third-party credential you’d normally use to call an external API).
 
-MCP Gateway (AgentCore “Tools & Gateways”)
+Configured the Lambda target (tool handler)
 
-Target = AWS Lambda (RefundToolEcho)
+Updated the Lambda code attached to the MCP Gateway so it:
 
-Inline tool schema (defines the tool interface, name + required inputs)
+handles tools/list and tools/call
 
-Client = Jupyter notebook calling the Gateway MCP endpoint using JSON-RPC:
+on tools/call, fetches credentials via AgentCore Identity APIs
 
-tools/list (discover tools)
+Set Lambda environment variables:
 
-tools/call (invoke tool)
+WORKLOAD_NAME = the workload identity name
 
-Tool definition (schema)
+APIKEY_PROVIDER_NAME = the API key provider name
 
-We defined a tool conceptually called process_refund with required fields:
+Invoked the tool through the MCP Gateway from SageMaker
 
-amount (integer)
+From the notebook, we called the MCP Gateway URL:
 
-reason (string)
+tools/list → confirmed the tool is discoverable
 
-Important nuance: when the gateway returns the tool list, it may return a gateway-prefixed tool name, e.g.:
-target-quick-start-6bd74e__process_refund
-That is the name you must use in tools/call.
+tools/call → triggered the Lambda tool execution
 
-Steps we executed
-1) Tool discovery test (tools/list)
+Lambda authenticated to AgentCore Identity and retrieved a credential
 
-From the notebook, we called:
+Inside Lambda:
 
-method: tools/list
+called GetWorkloadAccessToken using WORKLOAD_NAME → received a short-lived workloadAccessToken
 
-result: HTTP 200 with a tools array containing:
+called GetResourceApiKey using that token + APIKEY_PROVIDER_NAME → retrieved the API key
 
-tool name (prefixed by gateway)
+Lambda returned a success response showing:
 
-inputSchema showing amount and reason required
+inputs (amount/reason)
 
-✅ What this proves
+workload identity name
 
-Gateway endpoint is reachable
+provider name
 
-Gateway ↔ Lambda target wiring works for “tool discovery”
+masked API key (proof of retrieval without leaking the secret)
 
-Schema is being surfaced correctly through the MCP interface
+Big takeaway (what this proves about AgentCore Identity)
 
-2) Tool invocation test (tools/call)
+We proved that AgentCore Identity can act as a runtime credential broker: a workload can authenticate as a specific identity, obtain a short-lived token, and use that token to securely retrieve an outbound credential (API key) from a configured provider during tool execution—without hardcoding secrets in code.
 
-From the notebook, we called:
+In one line:
+Gateway tool call → Lambda execution → Identity token issued → credential access authorized → API key retrieved successfully.
 
-method: tools/call
+Without AgentCore Identity, runtime agents or services would need to store and manage external API credentials directly (for example, in environment variables, configuration files, or code). There would be no workload-level authentication, no short-lived identity tokens, and no runtime authorization checks before accessing protected credentials.
 
-params: { "name": "<tool_name_from_list>", "arguments": {"amount": 25, "reason":"damaged item"} }
-
-result: HTTP 200, "isError": false, content returned:
-
-"status": "OK", "message": "Refund processed"
-
-✅ What this proves
-
-The MCP Gateway successfully routed an invocation to the Lambda target
-
-The Lambda correctly parsed MCP JSON-RPC parameters and returned an MCP-style response
-
-End-to-end tool execution works via AgentCore Gateway (discover → invoke)
-
-How this proves “AgentCore capability” (without runtime agents)
-
-Even though we didn’t create a runtime Agent, we validated the core building block that agents rely on:
-
-What AgentCore provides here
-
-A standard tool protocol (MCP) for tool discovery/invocation
-
-A Gateway layer that:
-
-exposes tools consistently (tools/list)
-
-invokes tools consistently (tools/call)
-
-is designed to support identity + policy enforcement in front of tool execution
-
-In other words:
-✅ we proved “tooling infrastructure works” — which is a prerequisite for runtime agents to safely call tools.
-
-What we did NOT test yet
-
-Inbound identity enforcement (client ID/secret, Cognito, etc.)
-
-Policy enforcement blocking/allowing tool calls
-
-Runtime agent orchestration / model-driven tool selection
-
-Next steps: Add policy enforcement (the “real” control test)
-Objective
-
-Demonstrate that the Gateway enforces authorization rules on tool invocation.
-
-Simple policy test
-
-Create a policy such as:
-
-Permit process_refund only if amount <= 1000
-
-Deny otherwise
-
-Execution plan (what to run)
-
-You’ll run the same notebook flow, but with 2 calls:
-
-A) Expected PASS
-
-amount=25 → should succeed
-
-B) Expected DENY
-
-amount=5000 → should fail with a policy denial / evaluation error
-
-✅ What this will prove
-
-Policies are actually evaluated at the gateway boundary (not in your Lambda code)
-
-Tool calls can be centrally controlled (governance) without modifying the tool implementation
-
-This is the security/governance value of AgentCore Identity + Policy Engine
-
-Suggested “definition of done” for the policy test
-
-You can say the policy enforcement test is complete when:
-
-tools/list still works (or behaves as expected under your policy model)
-
-tools/call with amount=25 succeeds
-
-tools/call with amount=5000 fails before tool execution (policy denies)
-
-CloudWatch logs show the Lambda was invoked only for the allowed request (optional but strong evidence)
+AgentCore Identity introduces a secure control layer: a workload must first authenticate as a registered identity, obtain a short-lived token, and be explicitly authorized before retrieving outbound credentials. This enforces identity-based access control at runtime and eliminates the need to embed long-lived secrets in application logic
