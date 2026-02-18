@@ -1,132 +1,26 @@
-We created a Workload Identity
+When creating an AgentCore runtime by uploading a ZIP artifact from S3, the only strict requirements are:
 
 
+The ZIP must contain a valid Python project.
 
-A workload identity is:
 
-Just a named identity record inside AgentCore Identity.
+The entryPoint must reference an importable module and callable function.
 
 
-It is just a logical identity label.
+All dependencies must be declared in requirements.txt.
 
-Think:
 
-“There exists a workload named refund-service.”
+Beyond that, the internal code structure is flexible. You can vertically segment your agent by organizing tools into separate files or folders (for example, tools/echo.py, tools/math_add.py) and simply import and route them from your main entrypoint module. AgentCore does not require a single-file implementation — it only needs a resolvable entrypoint.
+In other words, when deploying via S3:
 
-That’s it.
 
-2️⃣ We used Lambda and passed in the workload name
+The S3 artifact defines the runtime package.
 
 
-Inside Lambda, we called:
+The entrypoint defines where execution begins.
 
-GetWorkloadAccessToken(workloadName="wid-abc")
 
+Your internal modular structure (multiple tool files, folders, layered design) is fully supported as long as it is importable.
 
-This tells AgentCore:
 
-“I want to authenticate as workload wid-abc.”
-
-AgentCore verifies the workload exists and returns a short-lived workload access token.
-
-That token proves:
-
-“This caller is wid-abc.”
-
-That is authentication.
-
-3️⃣ Lambda then used that token to retrieve the API key
-
-Correct.
-
-Lambda then called:
-
-GetResourceApiKey(
-    workloadIdentityToken=token,
-    resourceCredentialProviderName="demo-apikey-xyz"
-)
-
-
-Now AgentCore checks:
-
-Is this token valid?
-
-Is it unexpired?
-
-Does it represent workload wid-abc?
-
-Does provider demo-apikey-xyz exist?
-
-Is wid-abc allowed to retrieve that provider?
-
-If all checks pass:
-
-→ AgentCore returns the stored API key.
-
-That is authorization + credential brokering.
-
-4️⃣ That API key would then be used externally
-
-
-
-
-In production you tighten this in two layers:
-
-Who is allowed to mint a workload token for which workload identity
-
-Which credential providers that workload is allowed to read
-
-AgentCore Identity enforces credential access using a workload access token (token includes the agent/workload identity and optionally end-user identity), and that token is what’s required to obtain credentials from the vault/providers.
-
-Below is the production-ready way to extend what you built.
-
-Production extension: lock it down per service
-A) Create “one workload identity per service”
-
-Examples:
-
-refund-service
-
-billing-service
-
-github-sync-service
-
-This makes “authenticate as workload X vs Y” meaningful: it’s how AgentCore distinguishes services and can enforce different credential access per service.
-
-B) Create “one credential provider per external integration”
-
-Examples:
-
-stripe-api-key
-
-github-api-key
-
-zendesk-oauth
-
-C) Restrict token minting (GetWorkloadAccessToken)
-
-Your runtime (Lambda/ECS/EKS/etc.) should only be able to request a token for its own workload identity.
-
-In IAM terms, instead of allowing:
-
-bedrock-agentcore:GetWorkloadAccessToken on *
-
-you scope it to the specific workload identity (or to the AgentCore runtime identity service-linked role model where applicable). AWS’s AgentCore docs describe the workload access token flow and note newer setups use a service-linked role for runtime identity permissions.
-
-D) Restrict credential retrieval (GetResourceApiKey / OAuth)
-
-Then you scope:
-
-bedrock-agentcore:GetResourceApiKey (and/or OAuth equivalents)
-
-so that workload A can retrieve only provider(s) A needs, not everything.
-
-This is the practical “per-service secret isolation” model that makes workload identity worth doing.
-
-
-
-
-
-
-
-
+The key takeaway is that AgentCore runtime hosting is packaging-oriented, not file-structure–restricted — modular design is both supported and recommended.
