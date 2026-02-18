@@ -1,55 +1,20 @@
 import boto3, json, uuid
-from botocore.exceptions import ClientError
 
 REGION = "us-east-1"
 RUNTIME_ARN = "arn:aws:bedrock-agentcore:us-east-1:196856463470:runtime/hosted_agent_cjrmc-ZWwHuAHZG8"
-QUALIFIER = "DEFAULT"
 
-rt = boto3.client("bedrock-agentcore", region_name=REGION)
+client = boto3.client("bedrock-agentcore", region_name=REGION)
 
-def _read_agentcore_response(resp):
-    # Different SDK builds sometimes return different shapes.
-    if "response" in resp:
-        r = resp["response"]
-        if hasattr(r, "read"):   # StreamingBody-like
-            return r.read()
-        # Event-stream-like
-        out = b""
-        for event in r:
-            # best-effort extraction
-            for k in ("bytes", "chunk", "payload"):
-                if k in event:
-                    out += event[k]
-        return out
+def invoke(payload: dict):
+    resp = client.invoke_agent_runtime(
+        agentRuntimeArn=RUNTIME_ARN,
+        runtimeSessionId=str(uuid.uuid4()),  # must be 33+ chars per console note
+        payload=json.dumps(payload).encode("utf-8"),
+        contentType="application/json",
+        accept="application/json",
+        # qualifier OMITTED on purpose -> DEFAULT endpoint used
+    )
+    body = resp["response"].read()
+    return json.loads(body.decode("utf-8"))
 
-    # Some SDKs use "body"
-    if "body" in resp and hasattr(resp["body"], "read"):
-        return resp["body"].read()
-
-    return json.dumps(resp, default=str).encode("utf-8")
-
-def invoke(payload: dict, qualifier=QUALIFIER):
-    try:
-        resp = rt.invoke_agent_runtime(
-            agentRuntimeArn=RUNTIME_ARN,
-            runtimeSessionId=str(uuid.uuid4()),
-            qualifier=qualifier,
-            contentType="application/json",
-            accept="application/json",
-            payload=json.dumps(payload).encode("utf-8"),
-        )
-        raw = _read_agentcore_response(resp)
-        print("RAW RESPONSE BYTES:", raw[:500])
-        return json.loads(raw.decode("utf-8"))
-    except ClientError as e:
-        print("\n=== CLIENT ERROR ===")
-        print("Code:", e.response.get("Error", {}).get("Code"))
-        print("Message:", e.response.get("Error", {}).get("Message"))
-        print("Full:", json.dumps(e.response, indent=2, default=str)[:4000])
-        raise
-    except Exception as e:
-        print("\n=== NON-CLIENT ERROR ===")
-        print(type(e), e)
-        raise
-
-print("List tools:", invoke({"name": "list_tools"}))
+print(invoke({"name": "list_tools"}))
