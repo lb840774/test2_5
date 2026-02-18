@@ -1,60 +1,132 @@
-Process flow we executed (end-to-end)
+We created a Workload Identity
 
-Created a Workload Identity (WI)
 
-We created a standalone workload identity in AgentCore Identity (this is the “who is calling” identity the runtime will use).
 
-Created an Outbound Auth API Key provider
+A workload identity is:
 
-We stored a test API key value in AgentCore Identity as an “API key credential provider” (this represents a third-party credential you’d normally use to call an external API).
+Just a named identity record inside AgentCore Identity.
 
-Configured the Lambda target (tool handler)
 
-Updated the Lambda code attached to the MCP Gateway so it:
+It is just a logical identity label.
 
-handles tools/list and tools/call
+Think:
 
-on tools/call, fetches credentials via AgentCore Identity APIs
+“There exists a workload named refund-service.”
 
-Set Lambda environment variables:
+That’s it.
 
-WORKLOAD_NAME = the workload identity name
+2️⃣ We used Lambda and passed in the workload name
 
-APIKEY_PROVIDER_NAME = the API key provider name
 
-Invoked the tool through the MCP Gateway from SageMaker
+Inside Lambda, we called:
 
-From the notebook, we called the MCP Gateway URL:
+GetWorkloadAccessToken(workloadName="wid-abc")
 
-tools/list → confirmed the tool is discoverable
 
-tools/call → triggered the Lambda tool execution
+This tells AgentCore:
 
-Lambda authenticated to AgentCore Identity and retrieved a credential
+“I want to authenticate as workload wid-abc.”
 
-Inside Lambda:
+AgentCore verifies the workload exists and returns a short-lived workload access token.
 
-called GetWorkloadAccessToken using WORKLOAD_NAME → received a short-lived workloadAccessToken
+That token proves:
 
-called GetResourceApiKey using that token + APIKEY_PROVIDER_NAME → retrieved the API key
+“This caller is wid-abc.”
 
-Lambda returned a success response showing:
+That is authentication.
 
-inputs (amount/reason)
+3️⃣ Lambda then used that token to retrieve the API key
 
-workload identity name
+Correct.
 
-provider name
+Lambda then called:
 
-masked API key (proof of retrieval without leaking the secret)
+GetResourceApiKey(
+    workloadIdentityToken=token,
+    resourceCredentialProviderName="demo-apikey-xyz"
+)
 
-Big takeaway (what this proves about AgentCore Identity)
 
-We proved that AgentCore Identity can act as a runtime credential broker: a workload can authenticate as a specific identity, obtain a short-lived token, and use that token to securely retrieve an outbound credential (API key) from a configured provider during tool execution—without hardcoding secrets in code.
+Now AgentCore checks:
 
-In one line:
-Gateway tool call → Lambda execution → Identity token issued → credential access authorized → API key retrieved successfully.
+Is this token valid?
 
-Without AgentCore Identity, runtime agents or services would need to store and manage external API credentials directly (for example, in environment variables, configuration files, or code). There would be no workload-level authentication, no short-lived identity tokens, and no runtime authorization checks before accessing protected credentials.
+Is it unexpired?
 
-AgentCore Identity introduces a secure control layer: a workload must first authenticate as a registered identity, obtain a short-lived token, and be explicitly authorized before retrieving outbound credentials. This enforces identity-based access control at runtime and eliminates the need to embed long-lived secrets in application logic
+Does it represent workload wid-abc?
+
+Does provider demo-apikey-xyz exist?
+
+Is wid-abc allowed to retrieve that provider?
+
+If all checks pass:
+
+→ AgentCore returns the stored API key.
+
+That is authorization + credential brokering.
+
+4️⃣ That API key would then be used externally
+
+
+
+
+In production you tighten this in two layers:
+
+Who is allowed to mint a workload token for which workload identity
+
+Which credential providers that workload is allowed to read
+
+AgentCore Identity enforces credential access using a workload access token (token includes the agent/workload identity and optionally end-user identity), and that token is what’s required to obtain credentials from the vault/providers.
+
+Below is the production-ready way to extend what you built.
+
+Production extension: lock it down per service
+A) Create “one workload identity per service”
+
+Examples:
+
+refund-service
+
+billing-service
+
+github-sync-service
+
+This makes “authenticate as workload X vs Y” meaningful: it’s how AgentCore distinguishes services and can enforce different credential access per service.
+
+B) Create “one credential provider per external integration”
+
+Examples:
+
+stripe-api-key
+
+github-api-key
+
+zendesk-oauth
+
+C) Restrict token minting (GetWorkloadAccessToken)
+
+Your runtime (Lambda/ECS/EKS/etc.) should only be able to request a token for its own workload identity.
+
+In IAM terms, instead of allowing:
+
+bedrock-agentcore:GetWorkloadAccessToken on *
+
+you scope it to the specific workload identity (or to the AgentCore runtime identity service-linked role model where applicable). AWS’s AgentCore docs describe the workload access token flow and note newer setups use a service-linked role for runtime identity permissions.
+
+D) Restrict credential retrieval (GetResourceApiKey / OAuth)
+
+Then you scope:
+
+bedrock-agentcore:GetResourceApiKey (and/or OAuth equivalents)
+
+so that workload A can retrieve only provider(s) A needs, not everything.
+
+This is the practical “per-service secret isolation” model that makes workload identity worth doing.
+
+
+
+
+
+
+
+
