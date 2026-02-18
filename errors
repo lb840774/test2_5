@@ -1,157 +1,55 @@
-import json
+import boto3, json, uuid
+from botocore.exceptions import ClientError
 
-def _j(obj):
-    return json.dumps(obj, default=str)
+REGION = "us-east-1"
+RUNTIME_ARN = "arn:aws:bedrock-agentcore:us-east-1:196856463470:runtime/hosted_agent_cjrmc-ZWwHuAHZG8"
+QUALIFIER = "DEFAULT"
 
-def _try_json(x):
-    if isinstance(x, str):
-        try:
-            return json.loads(x)
-        except Exception:
-            return x
-    return x
+rt = boto3.client("bedrock-agentcore", region_name=REGION)
 
-def _resp(req, result=None, error=None):
-    base = {"jsonrpc": "2.0", "id": None}
-    if isinstance(req, dict):
-        base["jsonrpc"] = req.get("jsonrpc", "2.0")
-        base["id"] = req.get("id")
-    if error is None:
-        base["result"] = result
-    else:
-        base["error"] = error
-    return base
+def _read_agentcore_response(resp):
+    # Different SDK builds sometimes return different shapes.
+    if "response" in resp:
+        r = resp["response"]
+        if hasattr(r, "read"):   # StreamingBody-like
+            return r.read()
+        # Event-stream-like
+        out = b""
+        for event in r:
+            # best-effort extraction
+            for k in ("bytes", "chunk", "payload"):
+                if k in event:
+                    out += event[k]
+        return out
 
-def _infer_method(evt: dict):
-    # If the gateway sends non-JSON-RPC events
-    # tools/list often looks like {"tools": ...} or sometimes nothing but request intent
-    if "tools" in evt and isinstance(evt.get("tools"), list):
-        return "tools/list"
+    # Some SDKs use "body"
+    if "body" in resp and hasattr(resp["body"], "read"):
+        return resp["body"].read()
 
-    # tools/call often looks like {"name": "...", "arguments": {...}} or {"name": "...", "input": {...}}
-    if "name" in evt and ("arguments" in evt or "input" in evt or "toolName" in evt):
-        return "tools/call"
+    return json.dumps(resp, default=str).encode("utf-8")
 
-    # If it looks like ONLY tool input (amount/reason) assume tools/call for single-tool targets
-    if "amount" in evt or "reason" in evt:
-        return "tools/call"
+def invoke(payload: dict, qualifier=QUALIFIER):
+    try:
+        resp = rt.invoke_agent_runtime(
+            agentRuntimeArn=RUNTIME_ARN,
+            runtimeSessionId=str(uuid.uuid4()),
+            qualifier=qualifier,
+            contentType="application/json",
+            accept="application/json",
+            payload=json.dumps(payload).encode("utf-8"),
+        )
+        raw = _read_agentcore_response(resp)
+        print("RAW RESPONSE BYTES:", raw[:500])
+        return json.loads(raw.decode("utf-8"))
+    except ClientError as e:
+        print("\n=== CLIENT ERROR ===")
+        print("Code:", e.response.get("Error", {}).get("Code"))
+        print("Message:", e.response.get("Error", {}).get("Message"))
+        print("Full:", json.dumps(e.response, indent=2, default=str)[:4000])
+        raise
+    except Exception as e:
+        print("\n=== NON-CLIENT ERROR ===")
+        print(type(e), e)
+        raise
 
-    return None
-
-def _extract_req_method_params(event):
-    evt = _try_json(event)
-    if not isinstance(evt, dict):
-        return {}, None, {}
-
-    method = evt.get("method")
-    params = evt.get("params")
-
-    params = _try_json(params)
-
-    # If no JSON-RPC method, infer based on payload shape
-    if not method:
-        method = _infer_method(evt)
-
-    # If params missing, treat event itself as params for non-JSON-RPC shapes
-    if params is None:
-        params = evt
-
-    if not isinstance(params, dict):
-        params = {}
-
-    return evt, method, params
-
-def _extract_tool_name(params):
-    name = params.get("name") or params.get("toolName")
-    tool = params.get("tool")
-    if not name and isinstance(tool, dict):
-        name = tool.get("name")
-    return name
-
-def _extract_tool_input(params):
-    args = params.get("arguments")
-    if args is None:
-        args = params.get("input")
-    args = _try_json(args)
-    if args is None:
-        # Sometimes the params is already the input dict
-        args = {}
-    if not isinstance(args, dict):
-        args = {}
-    return args
-
-def _is_refund_tool(name: str) -> bool:
-    if not name:
-        return False
-    return name == "process_refund" or name.endswith("__process_refund")
-
-def lambda_handler(event, context):
-    print("=== RAW EVENT ===")
-    print(_j(event))
-
-    req, method, params = _extract_req_method_params(event)
-
-    print("=== PARSED ===")
-    print("method:", method)
-    print("params:", _j(params))
-
-    # tools/list
-    if method == "tools/list":
-        return _resp(req, result={
-            "tools": [
-                {
-                    "name": "process_refund",
-                    "description": "Process a refund request",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "amount": {"type": "integer", "description": "Refund amount"},
-                            "reason": {"type": "string", "description": "Reason for refund"}
-                        },
-                        "required": ["amount", "reason"]
-                    }
-                }
-            ]
-        })
-
-    # tools/call
-    if method == "tools/call":
-        tool_name = _extract_tool_name(params)
-        tool_input = _extract_tool_input(params)
-
-        # If gateway stripped name but params look like input, assume single tool
-        if not tool_name and ("amount" in params or "reason" in params):
-            tool_name = "process_refund"
-            tool_input = {**params}
-
-        print("tool_name:", tool_name)
-        print("tool_input:", _j(tool_input))
-
-        if not _is_refund_tool(tool_name):
-            return _resp(req, error={"code": -32601, "message": f"Unknown tool: {tool_name}"})
-
-        amount = tool_input.get("amount")
-        reason = tool_input.get("reason")
-
-        if amount is None or reason is None:
-            return _resp(req, error={
-                "code": -32602,
-                "message": "Missing required fields (amount, reason)",
-                "seen": {"tool_name": tool_name, "tool_input": tool_input, "params": params}
-            })
-
-        return _resp(req, result={
-            "content": [
-                {
-                    "type": "text",
-                    "text": json.dumps({
-                        "status": "OK",
-                        "amount": amount,
-                        "reason": reason,
-                        "message": "Refund processed"
-                    })
-                }
-            ]
-        })
-
-    return _resp(req, error={"code": -32601, "message": f"Unknown method: {method}"})
+print("List tools:", invoke({"name": "list_tools"}))
