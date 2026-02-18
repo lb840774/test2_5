@@ -1,48 +1,18 @@
-import boto3, uuid
+import boto3, json, uuid
 
-REGION = "us-east-1"
-RUNTIME_NAME = "multi_tools_s3_demo"
-RUNTIME_EXEC_ROLE_ARN = "arn:aws:iam::196856463470:role/<AgentCoreRuntimeExecutionRole>"
+rt = boto3.client("bedrock-agentcore", region_name="us-east-1")
 
-S3_BUCKET = "your-bucket"
-S3_PREFIX = "agentcore/my_agent_deploy.zip"
+def invoke(payload: dict, qualifier=None):
+    kwargs = dict(
+        agentRuntimeArn=RUNTIME_ARN,
+        runtimeSessionId="sess-" + str(uuid.uuid4()) + "-" + str(uuid.uuid4()),
+        payload=json.dumps(payload).encode("utf-8"),
+        contentType="application/json",
+        accept="application/json",
+    )
+    if qualifier:
+        kwargs["qualifier"] = qualifier  # optional (for non-default endpoints)
 
-# VPC config (required only if you want VPC mode)
-SUBNETS = ["subnet-xxxx", "subnet-yyyy"]
-SECURITY_GROUPS = ["sg-zzzz"]
-
-ctl = boto3.client("bedrock-agentcore-control", region_name=REGION)
-
-resp = ctl.create_agent_runtime(
-    agentRuntimeName=RUNTIME_NAME,
-    agentRuntimeArtifact={
-        "codeConfiguration": {
-            "code": {
-                "s3": {
-                    "bucket": S3_BUCKET,
-                    "prefix": S3_PREFIX,
-                    # "versionId": "..."  # optional
-                }
-            },
-            "runtime": "PYTHON_3_11",
-            # entryPoint is typically ["<python_file_or_module>", "<callable>"]
-            # Example if your file is app.py and function is invoke:
-            "entryPoint": ["app.py", "invoke"],
-        }
-    },
-    roleArn=RUNTIME_EXEC_ROLE_ARN,
-    networkConfiguration={
-        "networkMode": "VPC",
-        "networkModeConfig": {
-            "securityGroups": SECURITY_GROUPS,
-            "subnets": SUBNETS,
-        }
-    },
-    clientToken="sess-" + str(uuid.uuid4()) + "-" + str(uuid.uuid4()),
-)
-
-print(resp)
-RUNTIME_ID = resp["agentRuntimeId"]
-RUNTIME_ARN = resp["agentRuntimeArn"]
-print("RuntimeId:", RUNTIME_ID)
-print("RuntimeArn:", RUNTIME_ARN)
+    resp = rt.invoke_agent_runtime(**kwargs)
+    body = resp["response"].read()
+    return json.loads(body.decode("utf-8"))
