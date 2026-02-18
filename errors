@@ -1,8 +1,48 @@
-import boto3, json
-REGION="us-east-1"
-runtime_id="hosted_agent_cjrmc-ZWwHuAHZG8"
+import boto3, uuid
+
+REGION = "us-east-1"
+RUNTIME_NAME = "multi_tools_s3_demo"
+RUNTIME_EXEC_ROLE_ARN = "arn:aws:iam::196856463470:role/<AgentCoreRuntimeExecutionRole>"
+
+S3_BUCKET = "your-bucket"
+S3_PREFIX = "agentcore/my_agent_deploy.zip"
+
+# VPC config (required only if you want VPC mode)
+SUBNETS = ["subnet-xxxx", "subnet-yyyy"]
+SECURITY_GROUPS = ["sg-zzzz"]
 
 ctl = boto3.client("bedrock-agentcore-control", region_name=REGION)
-resp = ctl.get_agent_runtime(agentRuntimeId=runtime_id)
-print("STATUS:", resp.get("status"))
-print(json.dumps(resp, indent=2, default=str)[:3000])
+
+resp = ctl.create_agent_runtime(
+    agentRuntimeName=RUNTIME_NAME,
+    agentRuntimeArtifact={
+        "codeConfiguration": {
+            "code": {
+                "s3": {
+                    "bucket": S3_BUCKET,
+                    "prefix": S3_PREFIX,
+                    # "versionId": "..."  # optional
+                }
+            },
+            "runtime": "PYTHON_3_11",
+            # entryPoint is typically ["<python_file_or_module>", "<callable>"]
+            # Example if your file is app.py and function is invoke:
+            "entryPoint": ["app.py", "invoke"],
+        }
+    },
+    roleArn=RUNTIME_EXEC_ROLE_ARN,
+    networkConfiguration={
+        "networkMode": "VPC",
+        "networkModeConfig": {
+            "securityGroups": SECURITY_GROUPS,
+            "subnets": SUBNETS,
+        }
+    },
+    clientToken="sess-" + str(uuid.uuid4()) + "-" + str(uuid.uuid4()),
+)
+
+print(resp)
+RUNTIME_ID = resp["agentRuntimeId"]
+RUNTIME_ARN = resp["agentRuntimeArn"]
+print("RuntimeId:", RUNTIME_ID)
+print("RuntimeArn:", RUNTIME_ARN)
