@@ -81,7 +81,9 @@ print("Stage2 (LL) model artifact:", ll_estimator.model_data)
 
 cell4: 
 # =========================
-# STAGE 1 - PREPROCESS
+# STAGE 1 - PREPROCESS (CSV -> scaled CSV)
+# Supports Accept: application/json by returning CSV body (content-type json)
+# Fits scaler on 10 features to match your batch_input.csv shape
 # =========================
 
 import os
@@ -91,8 +93,12 @@ import io
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 
-# ---- Create dummy scaler ----
-X_train = [[1.0], [2.0], [3.0]]
+# ---- Fit scaler on 10 features (match your input) ----
+X_train = [
+    [1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0],
+    [2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.0],
+    [3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.0,12.0],
+]
 scaler = StandardScaler().fit(X_train)
 
 pre_dir = "/tmp/preprocess_model"
@@ -131,18 +137,28 @@ def predict_fn(data, model):
     return model.transform(data)
 
 def output_fn(prediction, accept):
-    if accept not in ("text/csv", "application/x-csv", "*/*"):
-        raise ValueError(f"Unsupported accept type: {accept}")
+    accept = (accept or "*/*").lower()
+
     out = io.StringIO()
     pd.DataFrame(prediction).to_csv(out, header=False, index=False)
-    return out.getvalue(), "text/csv"
+    body = out.getvalue()
+
+    # If Batch Transform asks for JSON, return CSV body anyway, but mark json
+    if "json" in accept:
+        return body, "application/json"
+
+    if accept not in ("text/csv", "application/x-csv", "*/*"):
+        raise ValueError(f"Unsupported accept type: {accept}")
+
+    return body, "text/csv"
 """)
 
 print("Wrote stage1 inference script:", pre_entry)
 
 cell5: 
 # =========================
-# STAGE 3 - POSTPROCESS
+# STAGE 3 - POSTPROCESS (predictions CSV -> (pred,label) CSV)
+# Supports Accept: application/json by returning CSV body (content-type json)
 # =========================
 
 import os
@@ -182,7 +198,10 @@ def input_fn(request_body, request_content_type):
         raise ValueError(f"Unsupported content type: {request_content_type}")
     s = request_body.decode("utf-8") if isinstance(request_body, (bytes, bytearray)) else request_body
     df = pd.read_csv(io.StringIO(s), header=None)
-    return df.iloc[:, 0].astype(float).values
+
+    # Expect first column to be prediction score
+    preds = df.iloc[:, 0].astype(float).values
+    return preds
 
 def predict_fn(preds, model):
     thr = float(np.median(preds)) if len(preds) else 0.0
@@ -190,14 +209,23 @@ def predict_fn(preds, model):
     return np.column_stack([preds, label])
 
 def output_fn(prediction, accept):
-    if accept not in ("text/csv", "application/x-csv", "*/*"):
-        raise ValueError(f"Unsupported accept type: {accept}")
+    accept = (accept or "*/*").lower()
+
     out = io.StringIO()
     pd.DataFrame(prediction).to_csv(out, header=False, index=False)
-    return out.getvalue(), "text/csv"
+    body = out.getvalue()
+
+    if "json" in accept:
+        return body, "application/json"
+
+    if accept not in ("text/csv", "application/x-csv", "*/*"):
+        raise ValueError(f"Unsupported accept type: {accept}")
+
+    return body, "text/csv"
 """)
 
 print("Wrote stage3 inference script:", post_entry)
+
 cell6: 
 from botocore.exceptions import ClientError
 
