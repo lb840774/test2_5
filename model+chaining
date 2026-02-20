@@ -7,13 +7,12 @@ import boto3
 import numpy as np
 import pandas as pd
 import joblib
-
 import sagemaker
+
 from sagemaker import image_uris
 from sagemaker.inputs import TrainingInput
 from sagemaker.estimator import Estimator
 from sagemaker.model import Model
-from sagemaker.pipeline import PipelineModel
 from sagemaker.sklearn.model import SKLearnModel
 
 sess = sagemaker.Session()
@@ -24,7 +23,7 @@ bucket = sess.default_bucket()
 sm = boto3.client("sagemaker", region_name=region)
 s3 = boto3.client("s3", region_name=region)
 
-run_id = f"skll-ll-3stage-batch-{int(time.time())}"
+run_id = f"chain3-{int(time.time())}"
 prefix = run_id
 
 print("region:", region)
@@ -39,8 +38,8 @@ from sklearn.model_selection import train_test_split
 X, y = make_regression(n_samples=5000, n_features=10, noise=10.0, random_state=42)
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-train_df = pd.DataFrame(np.column_stack([y_train, X_train]))  # label first col
-batch_in_df = pd.DataFrame(X_test)                            # features-only input to pipeline
+train_df = pd.DataFrame(np.column_stack([y_train, X_train]))  # label first col for Linear Learner training
+batch_in_df = pd.DataFrame(X_test)                            # features-only batch input
 
 local_train = "/tmp/ll_train.csv"
 local_batch_in = "/tmp/batch_input.csv"
@@ -78,7 +77,7 @@ ll_estimator.fit(
     wait=True
 )
 
-print("Linear Learner model artifact:", ll_estimator.model_data)
+print("Stage2 (LL) model artifact:", ll_estimator.model_data)
 
 cell4: 
 from sklearn.preprocessing import StandardScaler
@@ -96,9 +95,9 @@ with tarfile.open(pre_tar, "w:gz") as tar:
     tar.add(f"{pre_dir}/scaler.joblib", arcname="scaler.joblib")
 
 pre_s3 = sess.upload_data(pre_tar, bucket=bucket, key_prefix=f"{prefix}/artifacts/preprocess")
-print("preprocess model.tar.gz:", pre_s3)
+print("stage1 model.tar.gz:", pre_s3)
 
-# Inference script for sklearn container
+# Inference script for sklearn container (reads CSV -> outputs scaled CSV)
 pre_src_dir = "/tmp/preprocess_src"
 os.makedirs(pre_src_dir, exist_ok=True)
 pre_entry = os.path.join(pre_src_dir, "inference.py")
@@ -130,7 +129,7 @@ def output_fn(prediction, accept):
     return out.getvalue(), "text/csv"
 """)
 
-print("Wrote preprocess inference script:", pre_entry)
+print("Wrote stage1 inference script:", pre_entry)
 
 cell5: 
 post_dir = "/tmp/postprocess_model"
@@ -143,8 +142,9 @@ with tarfile.open(post_tar, "w:gz") as tar:
     tar.add(f"{post_dir}/config.txt", arcname="config.txt")
 
 post_s3 = sess.upload_data(post_tar, bucket=bucket, key_prefix=f"{prefix}/artifacts/postprocess")
-print("postprocess model.tar.gz:", post_s3)
+print("stage3 model.tar.gz:", post_s3)
 
+# Postprocess reads predictions CSV -> outputs (pred, derived_label) CSV
 post_src_dir = "/tmp/postprocess_src"
 os.makedirs(post_src_dir, exist_ok=True)
 post_entry = os.path.join(post_src_dir, "inference.py")
@@ -159,7 +159,6 @@ def model_fn(model_dir):
     return {"ok": True}
 
 def input_fn(request_body, request_content_type):
-    # Linear Learner emits text/csv; parse first column
     if request_content_type not in ("text/csv", "application/x-csv"):
         raise ValueError(f"Unsupported content type: {request_content_type}")
     s = request_body.decode("utf-8") if isinstance(request_body, (bytes, bytearray)) else request_body
@@ -170,8 +169,7 @@ def input_fn(request_body, request_content_type):
 def predict_fn(preds, model):
     thr = float(np.median(preds)) if len(preds) else 0.0
     label = (preds > thr).astype(int)
-    out = np.column_stack([preds, label])
-    return out
+    return np.column_stack([preds, label])
 
 def output_fn(prediction, accept):
     if accept not in ("text/csv", "application/x-csv", "*/*"):
@@ -181,11 +179,37 @@ def output_fn(prediction, accept):
     return out.getvalue(), "text/csv"
 """)
 
-print("Wrote postprocess inference script:", post_entry)
+print("Wrote stage3 inference script:", post_entry)
 
 cell6: 
-# SKLearn serving model wrappers (AWS-managed sklearn serving image)
-pre_model = SKLearnModel(
+from botocore.exceptions import ClientError
+
+mpg1 = f"{run_id}-stage1-pre"
+mpg2 = f"{run_id}-stage2-ll"
+mpg3 = f"{run_id}-stage3-post"
+
+def ensure_mpg(name, desc):
+    try:
+        sm.describe_model_package_group(ModelPackageGroupName=name)
+        print("MPG exists:", name)
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("ValidationException", "ResourceNotFound", "ResourceNotFoundException"):
+            sm.create_model_package_group(
+                ModelPackageGroupName=name,
+                ModelPackageGroupDescription=desc,
+            )
+            print("Created MPG:", name)
+        else:
+            raise
+
+ensure_mpg(mpg1, "Stage 1 preprocess (sklearn) - outputs scaled CSV")
+ensure_mpg(mpg2, "Stage 2 predictor (Linear Learner) - outputs predictions CSV")
+ensure_mpg(mpg3, "Stage 3 postprocess (sklearn) - outputs pred + label CSV")
+
+cell7: 
+# Stage1: sklearn model package
+stage1_model = SKLearnModel(
     model_data=pre_s3,
     role=role,
     entry_point="inference.py",
@@ -194,15 +218,49 @@ pre_model = SKLearnModel(
     sagemaker_session=sess,
 )
 
-# Linear Learner model wrapper
-ll_model = Model(
+mp1 = stage1_model.register(
+    content_types=["text/csv"],
+    response_types=["text/csv"],
+    inference_instances=["ml.m5.large"],
+    transform_instances=["ml.m5.large"],
+    model_package_group_name=mpg1,
+    approval_status="Approved",
+    description="Stage1 preprocess: raw features CSV -> scaled features CSV",
+    customer_metadata_properties={
+        "DownstreamStage": "stage2",
+        "ChainId": run_id
+    }
+)
+mp1_arn = mp1.model_package_arn
+print("Stage1 package:", mp1_arn)
+
+# Stage2: Linear Learner model package
+# (We register from a Model wrapper so we can set metadata linking stage1->stage2)
+stage2_model = Model(
     image_uri=ll_image,
     model_data=ll_estimator.model_data,
     role=role,
     sagemaker_session=sess,
 )
+mp2 = stage2_model.register(
+    content_types=["text/csv"],
+    response_types=["text/csv"],
+    inference_instances=["ml.m5.large"],
+    transform_instances=["ml.m5.large"],
+    model_package_group_name=mpg2,
+    approval_status="Approved",
+    description="Stage2 predictor: scaled features CSV -> predictions CSV",
+    customer_metadata_properties={
+        "UpstreamModelPackageArn": mp1_arn,
+        "DownstreamStage": "stage3",
+        "ChainId": run_id
+    }
+)
+mp2_arn = mp2.model_package_arn
+print("Stage2 package:", mp2_arn)
 
-post_model = SKLearnModel(
+# Stage3: sklearn model package
+stage3_model = SKLearnModel(
     model_data=post_s3,
     role=role,
     entry_point="inference.py",
@@ -211,116 +269,23 @@ post_model = SKLearnModel(
     sagemaker_session=sess,
 )
 
-pipeline_model_name = f"{run_id}-pipeline-model"
-
-pipeline_model = PipelineModel(
-    name=pipeline_model_name,
-    role=role,
-    models=[pre_model, ll_model, post_model],  # <-- 3 stages
-    sagemaker_session=sess,
-)
-
-print("PipelineModel created:", pipeline_model_name)
-
-cell7: 
-from botocore.exceptions import ClientError
-import sagemaker
-
-print("sagemaker sdk version:", sagemaker.__version__)
-
-model_package_group_name = f"{run_id}-3stage-pipeline"
-
-# 1) Ensure Model Package Group exists
-try:
-    sm.describe_model_package_group(ModelPackageGroupName=model_package_group_name)
-    print("Model Package Group exists:", model_package_group_name)
-
-except ClientError as e:
-    code = e.response.get("Error", {}).get("Code", "Unknown")
-    if code in ("ValidationException", "ResourceNotFound", "ResourceNotFoundException"):
-        print(f"Model Package Group not found (code={code}). Creating it...")
-        sm.create_model_package_group(
-            ModelPackageGroupName=model_package_group_name,
-            ModelPackageGroupDescription="3-stage batch inference pipeline: sklearn(pre) -> linear-learner -> sklearn(post)."
-        )
-        print("Created Model Package Group:", model_package_group_name)
-    else:
-        raise
-
-# 2) Register the 3-container pipeline as ONE model package
-mp = pipeline_model.register(
+mp3 = stage3_model.register(
     content_types=["text/csv"],
     response_types=["text/csv"],
     inference_instances=["ml.m5.large"],
     transform_instances=["ml.m5.large"],
-    model_package_group_name=model_package_group_name,
-    approval_status="Approved",   # or "PendingManualApproval"
-    description="3-stage serial pipeline (batch): preprocess -> predict -> postprocess"
+    model_package_group_name=mpg3,
+    approval_status="Approved",
+    description="Stage3 postprocess: predictions CSV -> (pred,label) CSV",
+    customer_metadata_properties={
+        "UpstreamModelPackageArn": mp2_arn,
+        "ChainId": run_id
+    }
 )
-
-print("register() return value:", mp)
-
-# 3) Get the ARN reliably (works even if register() returned None)
-resp = sm.list_model_packages(
-    ModelPackageGroupName=model_package_group_name,
-    SortBy="CreationTime",
-    SortOrder="Descending",
-    MaxResults=1
-)
-
-lst = resp.get("ModelPackageSummaryList", [])
-if not lst:
-    raise RuntimeError(
-        f"No model packages found in group {model_package_group_name} after register(). "
-        "That usually means the register call failed due to permissions or validation."
-    )
-
-arn = lst[0]["ModelPackageArn"]
-status = lst[0].get("ModelApprovalStatus")
-print("Registered Model Package ARN:", arn)
-print("Approval status:", status)
+mp3_arn = mp3.model_package_arn
+print("Stage3 package:", mp3_arn)
 
 cell8: 
-out_s3 = f"s3://{bucket}/{prefix}/batch_out/"
-
-transformer = pipeline_model.transformer(
-    instance_count=1,
-    instance_type="ml.m5.large",
-    output_path=out_s3,
-    assemble_with="Line",
-    accept="text/csv",
-)
-
-# This is the batch "invoke"
-transformer.transform(
-    data=batch_in_s3,
-    content_type="text/csv",
-    split_type="Line",
-    wait=True,
-)
-
-print("Batch transform complete. Output prefix:", out_s3)
-
-cell9: 
-def parse_s3_uri(uri):
-    assert uri.startswith("s3://")
-    rest = uri[5:]
-    b, _, k = rest.partition("/")
-    return b, k
-
-out_bucket, out_prefix = parse_s3_uri(out_s3)
-
-resp = s3.list_objects_v2(Bucket=out_bucket, Prefix=out_prefix)
-keys = [o["Key"] for o in resp.get("Contents", [])]
-print("Output objects:", keys)
-
-out_key = next((k for k in keys if k.endswith(".out")), keys[0])
-body = s3.get_object(Bucket=out_bucket, Key=out_key)["Body"].read().decode("utf-8")
-
-print(body[:1000])
-print("\nColumns are: prediction, derived_label")
-
-cell10: 
 from sagemaker.collection import Collection
 
 collection_name = f"{run_id}-collection"
@@ -330,8 +295,92 @@ try:
     col.create(collection_name)
     print("Created collection:", collection_name)
 except Exception as e:
-    print("Collection may already exist or not supported in your environment; continuing:", str(e)[:200])
+    print("Collection create may already exist or not supported in your environment; continuing:", str(e)[:200])
 
-# Add the pipeline group to the collection
-col.add_model_groups(collection_name, [model_package_group_name])
-print("Added to collection:", collection_name, "->", model_package_group_name)
+col.add_model_groups(collection_name, [mpg1, mpg2, mpg3])
+print("Added model groups to collection:", collection_name, "->", [mpg1, mpg2, mpg3])
+
+cell9: 
+def latest_approved_package(group_name: str) -> str:
+    resp = sm.list_model_packages(
+        ModelPackageGroupName=group_name,
+        ModelApprovalStatus="Approved",
+        SortBy="CreationTime",
+        SortOrder="Descending",
+        MaxResults=1,
+    )
+    lst = resp.get("ModelPackageSummaryList", [])
+    if not lst:
+        raise RuntimeError(f"No Approved packages found in {group_name}")
+    return lst[0]["ModelPackageArn"]
+
+cell10: 
+# Resolve the Approved packages (this is the “promotion” hook)
+p1 = latest_approved_package(mpg1)
+p2 = latest_approved_package(mpg2)
+p3 = latest_approved_package(mpg3)
+
+d1 = sm.describe_model_package(ModelPackageArn=p1)["InferenceSpecification"]["Containers"][0]
+d2 = sm.describe_model_package(ModelPackageArn=p2)["InferenceSpecification"]["Containers"][0]
+d3 = sm.describe_model_package(ModelPackageArn=p3)["InferenceSpecification"]["Containers"][0]
+
+containers = [
+    {"Image": d1["Image"], "ModelDataUrl": d1.get("ModelDataUrl"), "Environment": d1.get("Environment", {})},
+    {"Image": d2["Image"], "ModelDataUrl": d2.get("ModelDataUrl"), "Environment": d2.get("Environment", {})},
+    {"Image": d3["Image"], "ModelDataUrl": d3.get("ModelDataUrl"), "Environment": d3.get("Environment", {})},
+]
+
+model_name = f"{run_id}-serial3-model"
+sm.create_model(
+    ModelName=model_name,
+    ExecutionRoleArn=role,
+    Containers=containers  # <-- THIS is the serial inference pipeline definition
+)
+
+print("Created 3-container serial model:", model_name)
+
+cell11: 
+out_s3 = f"s3://{bucket}/{prefix}/batch_out/"
+
+job_name = f"{run_id}-xform"
+sm.create_transform_job(
+    TransformJobName=job_name,
+    ModelName=model_name,
+    TransformInput={
+        "DataSource": {"S3DataSource": {"S3DataType": "S3Prefix", "S3Uri": batch_in_s3}},
+        "ContentType": "text/csv",
+        "SplitType": "Line",
+    },
+    TransformOutput={
+        "S3OutputPath": out_s3,
+        "Accept": "text/csv",
+        "AssembleWith": "Line",
+    },
+    TransformResources={"InstanceType": "ml.m5.large", "InstanceCount": 1},
+)
+
+print("Started transform job:", job_name)
+
+waiter = sm.get_waiter("transform_job_completed_or_stopped")
+waiter.wait(TransformJobName=job_name)
+
+desc = sm.describe_transform_job(TransformJobName=job_name)
+print("Transform status:", desc["TransformJobStatus"])
+print("Output:", out_s3)
+
+cell12: 
+def parse_s3_uri(uri):
+    assert uri.startswith("s3://")
+    rest = uri[5:]
+    b, _, k = rest.partition("/")
+    return b, k
+
+b, pref = parse_s3_uri(out_s3)
+resp = s3.list_objects_v2(Bucket=b, Prefix=pref)
+keys = [o["Key"] for o in resp.get("Contents", [])]
+print("Output objects:", keys)
+
+out_key = next((k for k in keys if k.endswith(".out")), keys[0])
+body = s3.get_object(Bucket=b, Key=out_key)["Body"].read().decode("utf-8")
+print(body[:1000])
+print("\nColumns are: prediction, derived_label (from stage3)")
