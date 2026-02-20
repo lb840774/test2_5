@@ -224,19 +224,19 @@ print("PipelineModel created:", pipeline_model_name)
 
 cell7: 
 from botocore.exceptions import ClientError
+import sagemaker
+
+print("sagemaker sdk version:", sagemaker.__version__)
 
 model_package_group_name = f"{run_id}-3stage-pipeline"
 
-# Create the model package group if it doesn't exist
+# 1) Ensure Model Package Group exists
 try:
     sm.describe_model_package_group(ModelPackageGroupName=model_package_group_name)
     print("Model Package Group exists:", model_package_group_name)
 
 except ClientError as e:
     code = e.response.get("Error", {}).get("Code", "Unknown")
-    msg  = e.response.get("Error", {}).get("Message", str(e))
-
-    # SageMaker commonly returns ValidationException when the group doesn't exist
     if code in ("ValidationException", "ResourceNotFound", "ResourceNotFoundException"):
         print(f"Model Package Group not found (code={code}). Creating it...")
         sm.create_model_package_group(
@@ -245,21 +245,40 @@ except ClientError as e:
         )
         print("Created Model Package Group:", model_package_group_name)
     else:
-        # Something else is wrong (permissions, throttling, etc.)
         raise
 
-# Register pipeline as ONE package (represents the whole 3-container chain)
+# 2) Register the 3-container pipeline as ONE model package
 mp = pipeline_model.register(
     content_types=["text/csv"],
     response_types=["text/csv"],
     inference_instances=["ml.m5.large"],
     transform_instances=["ml.m5.large"],
     model_package_group_name=model_package_group_name,
-    approval_status="Approved",  # or "PendingManualApproval"
+    approval_status="Approved",   # or "PendingManualApproval"
     description="3-stage serial pipeline (batch): preprocess -> predict -> postprocess"
 )
 
-print("Registered Model Package ARN:", mp.model_package_arn)
+print("register() return value:", mp)
+
+# 3) Get the ARN reliably (works even if register() returned None)
+resp = sm.list_model_packages(
+    ModelPackageGroupName=model_package_group_name,
+    SortBy="CreationTime",
+    SortOrder="Descending",
+    MaxResults=1
+)
+
+lst = resp.get("ModelPackageSummaryList", [])
+if not lst:
+    raise RuntimeError(
+        f"No model packages found in group {model_package_group_name} after register(). "
+        "That usually means the register call failed due to permissions or validation."
+    )
+
+arn = lst[0]["ModelPackageArn"]
+status = lst[0].get("ModelApprovalStatus")
+print("Registered Model Package ARN:", arn)
+print("Approval status:", status)
 
 cell8: 
 out_s3 = f"s3://{bucket}/{prefix}/batch_out/"
