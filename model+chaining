@@ -81,31 +81,22 @@ print("Stage2 (LL) model artifact:", ll_estimator.model_data)
 
 cell4: 
 # =========================
-# STAGE 1 - PREPROCESS (CSV -> scaled CSV)
-# Supports Accept: application/json by returning CSV body (content-type json)
-# Fits scaler on 10 features to match your batch_input.csv shape
+# CELL 4 — STAGE 1 (PREPROCESS)
 # =========================
 
-import os
-import tarfile
+import os, io, tarfile
 import joblib
-import io
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 
-# ---- Fit scaler on 10 features (match your input) ----
-X_train = [
-    [1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0],
-    [2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.0],
-    [3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.0,12.0],
-]
+# ---- Fit scaler
 scaler = StandardScaler().fit(X_train)
 
 pre_dir = "/tmp/preprocess_model"
 os.makedirs(pre_dir, exist_ok=True)
 joblib.dump(scaler, f"{pre_dir}/scaler.joblib")
 
-# ---- Package model.tar.gz ----
+# ---- Package model artifact
 pre_tar = "/tmp/preprocess-model.tar.gz"
 with tarfile.open(pre_tar, "w:gz") as tar:
     tar.add(f"{pre_dir}/scaler.joblib", arcname="scaler.joblib")
@@ -113,13 +104,13 @@ with tarfile.open(pre_tar, "w:gz") as tar:
 pre_s3 = sess.upload_data(pre_tar, bucket=bucket, key_prefix=f"{prefix}/artifacts/preprocess")
 print("stage1 model.tar.gz:", pre_s3)
 
-# ---- Inference script ----
+# ---- Write inference script
 pre_src_dir = "/tmp/preprocess_src"
 os.makedirs(pre_src_dir, exist_ok=True)
 pre_entry = os.path.join(pre_src_dir, "inference.py")
 
-with open(pre_entry, "w") as f:
-    f.write("""import io
+inference_py = """
+import io
 import joblib
 import pandas as pd
 
@@ -129,8 +120,10 @@ def model_fn(model_dir):
 def input_fn(request_body, request_content_type):
     if request_content_type not in ("text/csv", "application/x-csv"):
         raise ValueError(f"Unsupported content type: {request_content_type}")
+
     s = request_body.decode("utf-8") if isinstance(request_body, (bytes, bytearray)) else request_body
     df = pd.read_csv(io.StringIO(s), header=None)
+
     return df.values
 
 def predict_fn(data, model):
@@ -143,35 +136,30 @@ def output_fn(prediction, accept):
     pd.DataFrame(prediction).to_csv(out, header=False, index=False)
     body = out.getvalue()
 
-    # If Batch Transform asks for JSON, return CSV body anyway, but mark json
     if "json" in accept:
         return body, "application/json"
 
-    if accept not in ("text/csv", "application/x-csv", "*/*"):
-        raise ValueError(f"Unsupported accept type: {accept}")
-
     return body, "text/csv"
-""")
+"""
+
+with open(pre_entry, "w") as f:
+    f.write(inference_py)
 
 print("Wrote stage1 inference script:", pre_entry)
-
 cell5: 
 # =========================
-# STAGE 3 - POSTPROCESS (predictions CSV -> (pred,label) CSV)
-# Supports Accept: application/json by returning CSV body (content-type json)
+# CELL 5 — STAGE 3 (POSTPROCESS)
 # =========================
 
-import os
-import tarfile
-import io
+import os, io, tarfile
 import numpy as np
 import pandas as pd
 
+# ---- Minimal artifact (required by SageMaker)
 post_dir = "/tmp/postprocess_model"
 os.makedirs(post_dir, exist_ok=True)
-
 with open(f"{post_dir}/config.txt", "w") as f:
-    f.write("postprocess-v1\n")
+    f.write("postprocess=v1\n")
 
 post_tar = "/tmp/postprocess-model.tar.gz"
 with tarfile.open(post_tar, "w:gz") as tar:
@@ -180,13 +168,13 @@ with tarfile.open(post_tar, "w:gz") as tar:
 post_s3 = sess.upload_data(post_tar, bucket=bucket, key_prefix=f"{prefix}/artifacts/postprocess")
 print("stage3 model.tar.gz:", post_s3)
 
-# ---- Inference script ----
+# ---- Write inference script
 post_src_dir = "/tmp/postprocess_src"
 os.makedirs(post_src_dir, exist_ok=True)
 post_entry = os.path.join(post_src_dir, "inference.py")
 
-with open(post_entry, "w") as f:
-    f.write("""import io
+inference_py = """
+import io
 import numpy as np
 import pandas as pd
 
@@ -196,17 +184,17 @@ def model_fn(model_dir):
 def input_fn(request_body, request_content_type):
     if request_content_type not in ("text/csv", "application/x-csv"):
         raise ValueError(f"Unsupported content type: {request_content_type}")
+
     s = request_body.decode("utf-8") if isinstance(request_body, (bytes, bytearray)) else request_body
     df = pd.read_csv(io.StringIO(s), header=None)
 
-    # Expect first column to be prediction score
     preds = df.iloc[:, 0].astype(float).values
     return preds
 
 def predict_fn(preds, model):
     thr = float(np.median(preds)) if len(preds) else 0.0
-    label = (preds > thr).astype(int)
-    return np.column_stack([preds, label])
+    labels = (preds > thr).astype(int)
+    return np.column_stack([preds, labels])
 
 def output_fn(prediction, accept):
     accept = (accept or "*/*").lower()
@@ -218,14 +206,13 @@ def output_fn(prediction, accept):
     if "json" in accept:
         return body, "application/json"
 
-    if accept not in ("text/csv", "application/x-csv", "*/*"):
-        raise ValueError(f"Unsupported accept type: {accept}")
-
     return body, "text/csv"
-""")
+"""
+
+with open(post_entry, "w") as f:
+    f.write(inference_py)
 
 print("Wrote stage3 inference script:", post_entry)
-
 cell6: 
 from botocore.exceptions import ClientError
 
