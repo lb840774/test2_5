@@ -80,16 +80,26 @@ ll_estimator.fit(
 print("Stage2 (LL) model artifact:", ll_estimator.model_data)
 
 cell4: 
+# =========================
+# STAGE 1 - PREPROCESS
+# =========================
+
+import os
+import tarfile
+import joblib
+import io
+import pandas as pd
 from sklearn.preprocessing import StandardScaler
 
-# Fit scaler on training features
+# ---- Create dummy scaler ----
+X_train = [[1.0], [2.0], [3.0]]
 scaler = StandardScaler().fit(X_train)
 
 pre_dir = "/tmp/preprocess_model"
 os.makedirs(pre_dir, exist_ok=True)
 joblib.dump(scaler, f"{pre_dir}/scaler.joblib")
 
-# Package model.tar.gz
+# ---- Package model.tar.gz ----
 pre_tar = "/tmp/preprocess-model.tar.gz"
 with tarfile.open(pre_tar, "w:gz") as tar:
     tar.add(f"{pre_dir}/scaler.joblib", arcname="scaler.joblib")
@@ -97,14 +107,13 @@ with tarfile.open(pre_tar, "w:gz") as tar:
 pre_s3 = sess.upload_data(pre_tar, bucket=bucket, key_prefix=f"{prefix}/artifacts/preprocess")
 print("stage1 model.tar.gz:", pre_s3)
 
-# Inference script for sklearn container (reads CSV -> outputs scaled CSV)
+# ---- Inference script ----
 pre_src_dir = "/tmp/preprocess_src"
 os.makedirs(pre_src_dir, exist_ok=True)
 pre_entry = os.path.join(pre_src_dir, "inference.py")
 
 with open(pre_entry, "w") as f:
-    f.write(r"""
-import io
+    f.write("""import io
 import joblib
 import pandas as pd
 
@@ -132,10 +141,21 @@ def output_fn(prediction, accept):
 print("Wrote stage1 inference script:", pre_entry)
 
 cell5: 
+# =========================
+# STAGE 3 - POSTPROCESS
+# =========================
+
+import os
+import tarfile
+import io
+import numpy as np
+import pandas as pd
+
 post_dir = "/tmp/postprocess_model"
 os.makedirs(post_dir, exist_ok=True)
+
 with open(f"{post_dir}/config.txt", "w") as f:
-    f.write("postprocess=v1\n")
+    f.write("postprocess-v1\n")
 
 post_tar = "/tmp/postprocess-model.tar.gz"
 with tarfile.open(post_tar, "w:gz") as tar:
@@ -144,14 +164,13 @@ with tarfile.open(post_tar, "w:gz") as tar:
 post_s3 = sess.upload_data(post_tar, bucket=bucket, key_prefix=f"{prefix}/artifacts/postprocess")
 print("stage3 model.tar.gz:", post_s3)
 
-# Postprocess reads predictions CSV -> outputs (pred, derived_label) CSV
+# ---- Inference script ----
 post_src_dir = "/tmp/postprocess_src"
 os.makedirs(post_src_dir, exist_ok=True)
 post_entry = os.path.join(post_src_dir, "inference.py")
 
 with open(post_entry, "w") as f:
-    f.write(r"""
-import io
+    f.write("""import io
 import numpy as np
 import pandas as pd
 
@@ -163,8 +182,7 @@ def input_fn(request_body, request_content_type):
         raise ValueError(f"Unsupported content type: {request_content_type}")
     s = request_body.decode("utf-8") if isinstance(request_body, (bytes, bytearray)) else request_body
     df = pd.read_csv(io.StringIO(s), header=None)
-    preds = df.iloc[:, 0].astype(float).values
-    return preds
+    return df.iloc[:, 0].astype(float).values
 
 def predict_fn(preds, model):
     thr = float(np.median(preds)) if len(preds) else 0.0
@@ -180,7 +198,6 @@ def output_fn(prediction, accept):
 """)
 
 print("Wrote stage3 inference script:", post_entry)
-
 cell6: 
 from botocore.exceptions import ClientError
 
