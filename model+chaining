@@ -223,18 +223,30 @@ pipeline_model = PipelineModel(
 print("PipelineModel created:", pipeline_model_name)
 
 cell7: 
+from botocore.exceptions import ClientError
+
 model_package_group_name = f"{run_id}-3stage-pipeline"
 
 # Create the model package group if it doesn't exist
 try:
     sm.describe_model_package_group(ModelPackageGroupName=model_package_group_name)
     print("Model Package Group exists:", model_package_group_name)
-except sm.exceptions.ResourceNotFound:
-    sm.create_model_package_group(
-        ModelPackageGroupName=model_package_group_name,
-        ModelPackageGroupDescription="3-stage batch inference pipeline: sklearn(pre) -> linear-learner -> sklearn(post)."
-    )
-    print("Created Model Package Group:", model_package_group_name)
+
+except ClientError as e:
+    code = e.response.get("Error", {}).get("Code", "Unknown")
+    msg  = e.response.get("Error", {}).get("Message", str(e))
+
+    # SageMaker commonly returns ValidationException when the group doesn't exist
+    if code in ("ValidationException", "ResourceNotFound", "ResourceNotFoundException"):
+        print(f"Model Package Group not found (code={code}). Creating it...")
+        sm.create_model_package_group(
+            ModelPackageGroupName=model_package_group_name,
+            ModelPackageGroupDescription="3-stage batch inference pipeline: sklearn(pre) -> linear-learner -> sklearn(post)."
+        )
+        print("Created Model Package Group:", model_package_group_name)
+    else:
+        # Something else is wrong (permissions, throttling, etc.)
+        raise
 
 # Register pipeline as ONE package (represents the whole 3-container chain)
 mp = pipeline_model.register(
@@ -243,7 +255,7 @@ mp = pipeline_model.register(
     inference_instances=["ml.m5.large"],
     transform_instances=["ml.m5.large"],
     model_package_group_name=model_package_group_name,
-    approval_status="Approved",  # use "PendingManualApproval" for real governance
+    approval_status="Approved",  # or "PendingManualApproval"
     description="3-stage serial pipeline (batch): preprocess -> predict -> postprocess"
 )
 
