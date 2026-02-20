@@ -286,19 +286,38 @@ mp3_arn = mp3.model_package_arn
 print("Stage3 package:", mp3_arn)
 
 cell8: 
-from sagemaker.collection import Collection
+def latest_approved(group_name: str) -> str:
+    resp = sm.list_model_packages(
+        ModelPackageGroupName=group_name,
+        ModelApprovalStatus="Approved",
+        SortBy="CreationTime",
+        SortOrder="Descending",
+        MaxResults=1
+    )
+    return resp["ModelPackageSummaryList"][0]["ModelPackageArn"]
 
-collection_name = f"{run_id}-collection"
-col = Collection(sess)
+p1 = latest_approved(mpg1)
+p2 = latest_approved(mpg2)
+p3 = latest_approved(mpg3)
 
-try:
-    col.create(collection_name)
-    print("Created collection:", collection_name)
-except Exception as e:
-    print("Collection create may already exist or not supported in your environment; continuing:", str(e)[:200])
+d1 = sm.describe_model_package(ModelPackageArn=p1)
+d2 = sm.describe_model_package(ModelPackageArn=p2)
+d3 = sm.describe_model_package(ModelPackageArn=p3)
 
-col.add_model_groups(collection_name, [mpg1, mpg2, mpg3])
-print("Added model groups to collection:", collection_name, "->", [mpg1, mpg2, mpg3])
+m1 = d1.get("CustomerMetadataProperties", {})
+m2 = d2.get("CustomerMetadataProperties", {})
+m3 = d3.get("CustomerMetadataProperties", {})
+
+print("=== 3-stage chain (latest Approved) ===")
+print("Stage1 package:", p1)
+print("  DownstreamStage:", m1.get("DownstreamStage"))
+print("Stage2 package:", p2)
+print("  UpstreamModelPackageArn:", m2.get("UpstreamModelPackageArn"))
+print("  DownstreamStage:", m2.get("DownstreamStage"))
+print("Stage3 package:", p3)
+print("  UpstreamModelPackageArn:", m3.get("UpstreamModelPackageArn"))
+
+print("\nChainId values:", m1.get("ChainId"), m2.get("ChainId"), m3.get("ChainId"))
 
 cell9: 
 def latest_approved_package(group_name: str) -> str:
