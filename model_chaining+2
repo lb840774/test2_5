@@ -425,3 +425,75 @@ s3.download_file(bucket, out_key, str(local_out))
 print("Downloaded:", local_out)
 pd.read_csv(local_out, header=None).head(10)
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def input_fn(request_body, request_content_type):
+    if request_content_type not in ("text/csv", "text/plain"):
+        raise ValueError(f"Unsupported content type: {request_content_type}")
+
+    s = request_body.decode("utf-8") if isinstance(request_body, (bytes, bytearray)) else str(request_body)
+
+    # Handle completely empty payloads
+    if not s.strip():
+        return np.empty((0, 2), dtype=float)
+
+    df = pd.read_csv(io.StringIO(s), header=None)
+
+    # If first row is header/non-numeric (e.g., "f1,f2"), drop it
+    try:
+        df.iloc[0].astype(float)
+    except Exception:
+        df = df.iloc[1:].reset_index(drop=True)
+
+    # If this invocation was ONLY the header line, df is now empty -> return empty
+    if df.shape[0] == 0:
+        return np.empty((0, 2), dtype=float)
+
+    # Expect exactly 2 columns
+    if df.shape[1] != 2:
+        raise ValueError(f"Stage1 expected 2 columns (f1,f2). Got {df.shape[1]}")
+
+    return df.astype(float).to_numpy()
+
+def predict_fn(data, model):
+    # If header-only invocation -> return empty
+    if data is None or (hasattr(data, "shape") and data.shape[0] == 0):
+        return np.empty((0,), dtype=float)
+
+    preds = model.predict_proba(data)[:, 1]  # or model.predict(data) depending on your model
+    return preds
+
+def output_fn(preds, accept):
+    # For empty header-only invocation, return empty string so it writes nothing / blank line
+    if preds is None or (hasattr(preds, "shape") and preds.shape[0] == 0):
+        return "", "text/plain"
+
+    # One prediction per line (plays nice with Line-based assemble)
+    body = "\n".join([str(float(x)) for x in preds])
+    return body, "text/plain"
+
+
+
+
+
+
+
