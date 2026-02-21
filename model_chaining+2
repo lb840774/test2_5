@@ -206,17 +206,25 @@ def build_model_tar(stage_name: str, model_obj, inference_py: str, out_dir: Path
     code_dir = stage_dir / "code"
     code_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save model
+    # save model
     joblib.dump(model_obj, stage_dir / "model.joblib")
 
-    # Save inference script
+    # write inference in BOTH places (root + code/)
+    (stage_dir / "inference.py").write_text(inference_py)
     (code_dir / "inference.py").write_text(inference_py)
 
-    # Build tar.gz
+    # ensure package import works
+    (code_dir / "__init__.py").write_text("")
+
     tar_path = out_dir / f"{stage_name}.tar.gz"
+    if tar_path.exists():
+        tar_path.unlink()
+
     with tarfile.open(tar_path, "w:gz") as tar:
         tar.add(stage_dir / "model.joblib", arcname="model.joblib")
         tar.add(code_dir / "inference.py", arcname="code/inference.py")
+        tar.add(code_dir / "__init__.py", arcname="code/__init__.py")
+        tar.add(stage_dir / "inference.py", arcname="inference.py")  # fallback
 
     return tar_path
 
@@ -225,25 +233,30 @@ tar1 = build_model_tar("stage1", m1, INFERENCE_STAGE1, artifacts_dir)
 tar2 = build_model_tar("stage2", m2, INFERENCE_STAGE2, artifacts_dir)
 tar3 = build_model_tar("stage3", m3, INFERENCE_STAGE3, artifacts_dir)
 
-print("Built:", tar1)
-print("Built:", tar2)
-print("Built:", tar3)
+print("Built:", tar1, tar2, tar3)
 
+# sanity check
+import tarfile
+for t in [tar1, tar2, tar3]:
+    with tarfile.open(t, "r:gz") as tf:
+        names = tf.getnames()
+    print("\n", t.name, "contains:")
+    print(" - code/inference.py:", "code/inference.py" in names)
+    print(" - code/__init__.py:", "code/__init__.py" in names)
+    print(" - inference.py:", "inference.py" in names)
 cell6: 
 def s3_upload(local_path: Path, s3_key: str) -> str:
     s3.upload_file(str(local_path), bucket, s3_key)
     return f"s3://{bucket}/{s3_key}"
 
-s3_stage1 = s3_upload(tar1, f"{prefix}/artifacts/stage1/model.tar.gz")
-s3_stage2 = s3_upload(tar2, f"{prefix}/artifacts/stage2/model.tar.gz")
-s3_stage3 = s3_upload(tar3, f"{prefix}/artifacts/stage3/model.tar.gz")
-
-s3_test = s3_upload(test_path, f"{prefix}/input/test_features.csv")
+ts = int(time.time())
+s3_stage1 = s3_upload(tar1, f"{prefix}/artifacts/stage1/model-{ts}.tar.gz")
+s3_stage2 = s3_upload(tar2, f"{prefix}/artifacts/stage2/model-{ts}.tar.gz")
+s3_stage3 = s3_upload(tar3, f"{prefix}/artifacts/stage3/model-{ts}.tar.gz")
 
 print("stage1:", s3_stage1)
 print("stage2:", s3_stage2)
 print("stage3:", s3_stage3)
-print("test:", s3_test)
 
 cell7: 
 framework = "sklearn"
