@@ -497,3 +497,121 @@ def output_fn(preds, accept):
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def input_fn(request_body, request_content_type):
+    print(f"[STAGE1] input_fn content_type={request_content_type}")
+
+    if request_content_type not in ("text/csv", "text/plain"):
+        raise ValueError(f"Unsupported content type: {request_content_type}")
+
+    s = request_body.decode("utf-8") if isinstance(request_body, (bytes, bytearray)) else str(request_body)
+    s_stripped = s.strip()
+
+    # Empty payload (blank line)
+    if not s_stripped:
+        print("[STAGE1] input_fn: EMPTY payload -> returning None")
+        return None
+
+    df = pd.read_csv(io.StringIO(s), header=None)
+    print(f"[STAGE1] input_fn: raw df shape={df.shape} first_row={df.iloc[0].tolist() if df.shape[0] else 'n/a'}")
+
+    # If first row is header/non-numeric, drop it
+    if df.shape[0] > 0:
+        try:
+            df.iloc[0].astype(float)
+        except Exception:
+            df = df.iloc[1:].reset_index(drop=True)
+            print(f"[STAGE1] input_fn: dropped header -> df shape now {df.shape}")
+
+    # Header-only invocation (now empty)
+    if df.shape[0] == 0:
+        print("[STAGE1] input_fn: HEADER-ONLY invocation -> returning None")
+        return None
+
+    if df.shape[1] != 2:
+        raise ValueError(f"Stage1 expected 2 columns (f1,f2). Got {df.shape[1]}")
+
+    arr = df.astype(float).to_numpy()
+    print(f"[STAGE1] input_fn: returning array shape={arr.shape}")
+    return arr
+
+
+def _is_empty_batch(x):
+    if x is None:
+        return True
+    # numpy / sparse-ish
+    if hasattr(x, "shape"):
+        try:
+            return x.shape[0] == 0
+        except Exception:
+            pass
+    # list-like
+    try:
+        return len(x) == 0
+    except Exception:
+        return False
+
+
+def predict_fn(data, model):
+    print(f"[STAGE1] predict_fn type={type(data)}")
+    if _is_empty_batch(data):
+        print("[STAGE1] predict_fn: EMPTY batch -> returning None (no predictions)")
+        return None
+
+    # ensure numpy array
+    if not isinstance(data, np.ndarray):
+        data = np.array(data)
+
+    if data.ndim == 1:
+        data = data.reshape(1, -1)
+
+    if data.shape[0] == 0:
+        print("[STAGE1] predict_fn: array has 0 rows -> returning None")
+        return None
+
+    print(f"[STAGE1] predict_fn: calling model on shape={data.shape}")
+    preds = model.predict_proba(data)[:, 1]
+    return preds
+
+
+def output_fn(preds, accept):
+    print(f"[STAGE1] output_fn accept={accept} preds_type={type(preds)}")
+    if preds is None:
+        # IMPORTANT: return empty body for header-only/blank line invocations
+        return "", "text/plain"
+
+    preds = np.array(preds).reshape(-1)
+    body = "\n".join(str(float(x)) for x in preds)
+    return body, "text/plain"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
