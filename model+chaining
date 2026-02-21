@@ -80,23 +80,25 @@ ll_estimator.fit(
 print("Stage2 (LL) model artifact:", ll_estimator.model_data)
 
 cell4: 
-# =========================
+# ==========================
 # CELL 4 — STAGE 1 (PREPROCESS)
-# =========================
+# ==========================
 
 import os, io, tarfile
 import joblib
 import pandas as pd
+import numpy as np
 from sklearn.preprocessing import StandardScaler
 
-# ---- Fit scaler
+# Fit scaler on training features
 scaler = StandardScaler().fit(X_train)
 
+# --- Save artifact
 pre_dir = "/tmp/preprocess_model"
 os.makedirs(pre_dir, exist_ok=True)
 joblib.dump(scaler, f"{pre_dir}/scaler.joblib")
 
-# ---- Package model artifact
+# --- Package model.tar.gz
 pre_tar = "/tmp/preprocess-model.tar.gz"
 with tarfile.open(pre_tar, "w:gz") as tar:
     tar.add(f"{pre_dir}/scaler.joblib", arcname="scaler.joblib")
@@ -104,58 +106,89 @@ with tarfile.open(pre_tar, "w:gz") as tar:
 pre_s3 = sess.upload_data(pre_tar, bucket=bucket, key_prefix=f"{prefix}/artifacts/preprocess")
 print("stage1 model.tar.gz:", pre_s3)
 
-# ---- Write inference script
+# --- Write inference script
 pre_src_dir = "/tmp/preprocess_src"
 os.makedirs(pre_src_dir, exist_ok=True)
 pre_entry = os.path.join(pre_src_dir, "inference.py")
 
-inference_py = """
+inference_py = r'''
 import io
+import json
 import joblib
+import numpy as np
 import pandas as pd
 
 def model_fn(model_dir):
     return joblib.load(f"{model_dir}/scaler.joblib")
 
-def input_fn(request_body, request_content_type):
-    if request_content_type not in ("text/csv", "application/x-csv"):
-        raise ValueError(f"Unsupported content type: {request_content_type}")
-
-    s = request_body.decode("utf-8") if isinstance(request_body, (bytes, bytearray)) else request_body
+def _to_ndarray_from_csv_bytes(b):
+    s = b.decode("utf-8") if isinstance(b, (bytes, bytearray)) else str(b)
     df = pd.read_csv(io.StringIO(s), header=None)
-
     return df.values
 
+def _to_ndarray_from_jsonlines_bytes(b):
+    s = b.decode("utf-8") if isinstance(b, (bytes, bytearray)) else str(b)
+    rows = []
+    for line in s.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        obj = json.loads(line)
+        # Try common patterns; fall back to "first numeric in object"
+        if isinstance(obj, dict):
+            if "features" in obj:
+                rows.append(obj["features"])
+                continue
+            # pick first list value or first numeric
+            for v in obj.values():
+                if isinstance(v, list):
+                    rows.append(v)
+                    break
+                if isinstance(v, (int, float)):
+                    rows.append([v])
+                    break
+        elif isinstance(obj, list):
+            rows.append(obj)
+    return np.array(rows, dtype=float)
+
+def input_fn(request_body, request_content_type):
+    ct = (request_content_type or "").lower()
+
+    if "jsonlines" in ct:
+        return _to_ndarray_from_jsonlines_bytes(request_body)
+
+    # default to CSV (this is what we want for pipeline -> LinearLearner)
+    if "csv" in ct or ct == "" or ct == "application/octet-stream":
+        return _to_ndarray_from_csv_bytes(request_body)
+
+    raise ValueError(f"Unsupported content type: {request_content_type}")
+
 def predict_fn(data, model):
+    # model is a fitted StandardScaler
     return model.transform(data)
 
 def output_fn(prediction, accept):
-    accept = (accept or "*/*").lower()
-
+    # IMPORTANT: Always return CSV so container 2 can parse it reliably.
     out = io.StringIO()
     pd.DataFrame(prediction).to_csv(out, header=False, index=False)
-    body = out.getvalue()
-
-    if "json" in accept:
-        return body, "application/json"
-
-    return body, "text/csv"
-"""
+    return out.getvalue(), "text/csv"
+'''
 
 with open(pre_entry, "w") as f:
     f.write(inference_py)
 
 print("Wrote stage1 inference script:", pre_entry)
+
 cell5: 
-# =========================
+# ==========================
 # CELL 5 — STAGE 3 (POSTPROCESS)
-# =========================
+# ==========================
 
 import os, io, tarfile
 import numpy as np
 import pandas as pd
 
-# ---- Minimal artifact (required by SageMaker)
+# --- Minimal artifact required by SageMaker
 post_dir = "/tmp/postprocess_model"
 os.makedirs(post_dir, exist_ok=True)
 with open(f"{post_dir}/config.txt", "w") as f:
@@ -168,51 +201,81 @@ with tarfile.open(post_tar, "w:gz") as tar:
 post_s3 = sess.upload_data(post_tar, bucket=bucket, key_prefix=f"{prefix}/artifacts/postprocess")
 print("stage3 model.tar.gz:", post_s3)
 
-# ---- Write inference script
+# --- Write inference script
 post_src_dir = "/tmp/postprocess_src"
 os.makedirs(post_src_dir, exist_ok=True)
 post_entry = os.path.join(post_src_dir, "inference.py")
 
-inference_py = """
+inference_py = r'''
 import io
+import json
 import numpy as np
 import pandas as pd
 
 def model_fn(model_dir):
     return {"ok": True}
 
-def input_fn(request_body, request_content_type):
-    if request_content_type not in ("text/csv", "application/x-csv"):
-        raise ValueError(f"Unsupported content type: {request_content_type}")
-
-    s = request_body.decode("utf-8") if isinstance(request_body, (bytes, bytearray)) else request_body
+def _preds_from_csv(body):
+    s = body.decode("utf-8") if isinstance(body, (bytes, bytearray)) else str(body)
     df = pd.read_csv(io.StringIO(s), header=None)
+    # Expect first column to be prediction score
+    return df.iloc[:, 0].astype(float).values
 
-    preds = df.iloc[:, 0].astype(float).values
-    return preds
+def _preds_from_jsonlines(body):
+    s = body.decode("utf-8") if isinstance(body, (bytes, bytearray)) else str(body)
+    preds = []
+    for line in s.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        obj = json.loads(line)
+
+        # Try common keys first
+        if isinstance(obj, dict):
+            for k in ["score", "predicted_label", "prediction", "probability"]:
+                if k in obj and isinstance(obj[k], (int, float)):
+                    preds.append(float(obj[k]))
+                    break
+            else:
+                # fallback: first numeric value in dict
+                for v in obj.values():
+                    if isinstance(v, (int, float)):
+                        preds.append(float(v))
+                        break
+        elif isinstance(obj, (int, float)):
+            preds.append(float(obj))
+        elif isinstance(obj, list) and len(obj) > 0 and isinstance(obj[0], (int, float)):
+            preds.append(float(obj[0]))
+
+    return np.array(preds, dtype=float)
+
+def input_fn(request_body, request_content_type):
+    ct = (request_content_type or "").lower()
+
+    # LinearLearner commonly returns jsonlines in pipeline mode
+    if "jsonlines" in ct:
+        return _preds_from_jsonlines(request_body)
+
+    if "csv" in ct or "application/x-csv" in ct:
+        return _preds_from_csv(request_body)
+
+    if "json" in ct:
+        # could be JSON array or similar; try as jsonlines fallback
+        return _preds_from_jsonlines(request_body)
+
+    raise ValueError(f"Unsupported content type: {request_content_type}")
 
 def predict_fn(preds, model):
+    # Create 10x3 output: [pred_score, label, threshold]
     thr = float(np.median(preds)) if len(preds) else 0.0
-    labels = (preds > thr).astype(int)
-    return np.column_stack([preds, labels])
+    label = (preds > thr).astype(int)
+    thr_col = np.full_like(preds, thr, dtype=float)
+    return np.column_stack([preds.astype(float), label.astype(int), thr_col])
 
 def output_fn(prediction, accept):
-    accept = (accept or "*/*").lower()
-
+    # Return CSV (safe for Batch Transform)
     out = io.StringIO()
-    pd.DataFrame(prediction).to_csv(out, header=False, index=False)
-    body = out.getvalue()
-
-    if "json" in accept:
-        return body, "application/json"
-
-    return body, "text/csv"
-"""
-
-with open(post_entry, "w") as f:
-    f.write(inference_py)
-
-print("Wrote stage3 inference script:", post_entry)
+   
 cell6: 
 from botocore.exceptions import ClientError
 
