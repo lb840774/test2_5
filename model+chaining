@@ -498,3 +498,68 @@ out_key = next((k for k in keys if k.endswith(".out")), keys[0])
 body = s3.get_object(Bucket=b, Key=out_key)["Body"].read().decode("utf-8")
 print(body[:1000])
 print("\nColumns are: prediction, derived_label (from stage3)")
+
+
+
+
+
+
+import boto3, os, tarfile
+from urllib.parse import urlparse
+
+MODEL_TAR_S3 = "s3://YOUR-BUCKET/YOUR-PREFIX/artifacts/postprocess/postprocess-model.tar.gz"  # <-- paste your stage3 path
+
+def parse_s3_uri(s3_uri: str):
+    p = urlparse(s3_uri)
+    if p.scheme != "s3":
+        raise ValueError(f"Not an s3:// URI: {s3_uri}")
+    return p.netloc, p.path.lstrip("/")
+
+bucket, key = parse_s3_uri(MODEL_TAR_S3)
+local_path = "/tmp/postprocess-model.tar.gz"
+
+s3 = boto3.client("s3")
+s3.download_file(bucket, key, local_path)
+print("Downloaded to:", local_path, "size:", os.path.getsize(local_path), "bytes")
+
+with tarfile.open(local_path, "r:gz") as tf:
+    names = tf.getnames()
+
+print("\n--- First 80 entries in tar ---")
+for n in names[:80]:
+    print(n)
+
+print("\n--- Does it contain code/inference.py? ---")
+print("code/inference.py" in names)
+
+print("\n--- Any inference.py occurrences? ---")
+for n in names:
+    if n.endswith("inference.py"):
+        print("FOUND:", n)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
