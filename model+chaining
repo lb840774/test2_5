@@ -80,193 +80,154 @@ ll_estimator.fit(
 print("Stage2 (LL) model artifact:", ll_estimator.model_data)
 
 cell4: 
-# ==========================
+# =========================
 # CELL 4 — STAGE 1 (PREPROCESS)
-# ==========================
+# =========================
 
-import os, io, tarfile
-import joblib
-import pandas as pd
+import os, io, json, tarfile, time
 import numpy as np
+import pandas as pd
+import joblib
+import boto3
 from sklearn.preprocessing import StandardScaler
 
-# Fit scaler on training features
-scaler = StandardScaler().fit(X_train)
+assert "bucket" in globals() and bucket, "Define `bucket` first"
+assert "key_prefix" in globals() and key_prefix, "Define `key_prefix` first"
 
-# --- Save artifact
-pre_dir = "/tmp/preprocess_model"
-os.makedirs(pre_dir, exist_ok=True)
-joblib.dump(scaler, f"{pre_dir}/scaler.joblib")
+s3 = boto3.client("s3")
+run_id = f"run-{int(time.time())}"
 
-# --- Package model.tar.gz
-pre_tar = "/tmp/preprocess-model.tar.gz"
-with tarfile.open(pre_tar, "w:gz") as tar:
-    tar.add(f"{pre_dir}/scaler.joblib", arcname="scaler.joblib")
+# --- Create 10x3 training data (REQUIRED for your scaler fit) ---
+np.random.seed(7)
+X_train = np.random.randn(10, 3)  # 10 rows x 3 cols
+scaler = StandardScaler()
+scaler.fit(X_train)
 
-pre_s3 = sess.upload_data(pre_tar, bucket=bucket, key_prefix=f"{prefix}/artifacts/preprocess")
-print("stage1 model.tar.gz:", pre_s3)
-
-# --- Write inference script
-pre_src_dir = "/tmp/preprocess_src"
+# --- Local build dir ---
+pre_src_dir = f"/tmp/preprocess_src_{run_id}"
 os.makedirs(pre_src_dir, exist_ok=True)
-pre_entry = os.path.join(pre_src_dir, "inference.py")
 
-inference_py = r'''
+# Save artifact
+scaler_path = os.path.join(pre_src_dir, "scaler.joblib")
+joblib.dump(scaler, scaler_path)
+
+# --- inference.py MUST be at root of source_dir (pre_src_dir/inference.py) ---
+pre_inference_py = r'''
+print("### LOADED STAGE1 PREPROCESS inference.py v4 ###")
+
 import io
-import json
-import joblib
 import numpy as np
 import pandas as pd
+import joblib
+import os
 
 def model_fn(model_dir):
-    return joblib.load(f"{model_dir}/scaler.joblib")
+    # model_dir contains scaler.joblib
+    scaler_path = os.path.join(model_dir, "scaler.joblib")
+    scaler = joblib.load(scaler_path)
+    return scaler
 
-def _to_ndarray_from_csv_bytes(b):
-    s = b.decode("utf-8") if isinstance(b, (bytes, bytearray)) else str(b)
+def input_fn(request_body, request_content_type):
+    if request_content_type not in ("text/csv", "application/x-csv"):
+        raise ValueError(f"Unsupported content type: {request_content_type}")
+    s = request_body.decode("utf-8") if isinstance(request_body, (bytes, bytearray)) else request_body
     df = pd.read_csv(io.StringIO(s), header=None)
     return df.values
 
-def _to_ndarray_from_jsonlines_bytes(b):
-    s = b.decode("utf-8") if isinstance(b, (bytes, bytearray)) else str(b)
-    rows = []
-    for line in s.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        obj = json.loads(line)
-        # Try common patterns; fall back to "first numeric in object"
-        if isinstance(obj, dict):
-            if "features" in obj:
-                rows.append(obj["features"])
-                continue
-            # pick first list value or first numeric
-            for v in obj.values():
-                if isinstance(v, list):
-                    rows.append(v)
-                    break
-                if isinstance(v, (int, float)):
-                    rows.append([v])
-                    break
-        elif isinstance(obj, list):
-            rows.append(obj)
-    return np.array(rows, dtype=float)
-
-def input_fn(request_body, request_content_type):
-    ct = (request_content_type or "").lower()
-
-    if "jsonlines" in ct:
-        return _to_ndarray_from_jsonlines_bytes(request_body)
-
-    # default to CSV (this is what we want for pipeline -> LinearLearner)
-    if "csv" in ct or ct == "" or ct == "application/octet-stream":
-        return _to_ndarray_from_csv_bytes(request_body)
-
-    raise ValueError(f"Unsupported content type: {request_content_type}")
-
 def predict_fn(data, model):
-    # model is a fitted StandardScaler
-    return model.transform(data)
+    # model is a StandardScaler
+    scaled = model.transform(data)
+    return scaled
 
 def output_fn(prediction, accept):
-    # IMPORTANT: Always return CSV so container 2 can parse it reliably.
     out = io.StringIO()
     pd.DataFrame(prediction).to_csv(out, header=False, index=False)
     return out.getvalue(), "text/csv"
 '''
+with open(os.path.join(pre_src_dir, "inference.py"), "w") as f:
+    f.write(pre_inference_py)
 
-with open(pre_entry, "w") as f:
-    f.write(inference_py)
+# --- Build model.tar.gz with artifacts at ROOT (scaler.joblib + inference.py) ---
+pre_tar_path = f"/tmp/preprocess-model-{run_id}.tar.gz"
+with tarfile.open(pre_tar_path, "w:gz") as tar:
+    tar.add(scaler_path, arcname="scaler.joblib")
+    tar.add(os.path.join(pre_src_dir, "inference.py"), arcname="inference.py")
 
-print("Wrote stage1 inference script:", pre_entry)
+# --- Upload to S3 ---
+pre_s3_key = f"{key_prefix}/preprocess/preprocess-model-{run_id}.tar.gz"
+s3.upload_file(pre_tar_path, bucket, pre_s3_key)
 
+stage1_model_data_url = f"s3://{bucket}/{pre_s3_key}"
+print("✅ Stage1 model_data_url:", stage1_model_data_url)
+print("✅ Local tar:", pre_tar_path, "size:", os.path.getsize(pre_tar_path), "bytes")
 cell5: 
-import os, io, tarfile
+# =========================
+# CELL 5 — STAGE 3 (POSTPROCESS)
+# =========================
+
+import os, io, json, tarfile, time
 import numpy as np
 import pandas as pd
+import boto3
 
-# --- Minimal artifact required by SageMaker
-post_dir = "/tmp/postprocess_model"
-code_dir = os.path.join(post_dir, "code")
-os.makedirs(code_dir, exist_ok=True)
+assert "bucket" in globals() and bucket, "Define `bucket` first"
+assert "key_prefix" in globals() and key_prefix, "Define `key_prefix` first"
 
-# 1) Define inference code FIRST
-inference_py = r'''
+s3 = boto3.client("s3")
+run_id = f"run-{int(time.time())}"
+
+# --- Local build dir ---
+post_src_dir = f"/tmp/postprocess_src_{run_id}"
+os.makedirs(post_src_dir, exist_ok=True)
+
+# --- inference.py MUST be at root of source_dir (post_src_dir/inference.py) ---
+# Add a loud marker print so CloudWatch proves you’re using this exact code
+post_inference_py = r'''
+print("### LOADED STAGE3 POSTPROCESS inference.py v4 ###")
+
 import io
-import json
 import numpy as np
 import pandas as pd
 
 def model_fn(model_dir):
+    # No model artifact needed for this simple postprocess
     return {"ok": True}
 
 def input_fn(request_body, request_content_type):
-    ct = (request_content_type or "").lower()
-
-    # Batch Transform often sends application/jsonlines
-    if "jsonlines" in ct:
-        s = request_body.decode("utf-8") if isinstance(request_body, (bytes, bytearray)) else request_body
-        # parse JSONL -> list of records
-        recs = [json.loads(line) for line in s.strip().splitlines() if line.strip()]
-        # Expect each record to be a list/array of features
-        arr = np.array(recs, dtype=float)
-        return arr
-
-    if ct in ("text/csv", "application/x-csv"):
-        s = request_body.decode("utf-8") if isinstance(request_body, (bytes, bytearray)) else request_body
-        df = pd.read_csv(io.StringIO(s), header=None)
-        # expect first col contains prediction score
-        preds = df.iloc[:, 0].astype(float).values
-        return preds
-
-    raise ValueError(f"Unsupported content type: {request_content_type}")
+    if request_content_type not in ("text/csv", "application/x-csv"):
+        raise ValueError(f"Unsupported content type: {request_content_type}")
+    s = request_body.decode("utf-8") if isinstance(request_body, (bytes, bytearray)) else request_body
+    df = pd.read_csv(io.StringIO(s), header=None)
+    return df.values
 
 def predict_fn(data, model):
-    # If stage3 receives preds (1D), make (pred,label)
-    if isinstance(data, np.ndarray) and data.ndim == 2:
-        # if someone sends 2D already, pass through
-        arr = data
-    else:
-        preds = np.array(data, dtype=float).reshape(-1)
-        thr = float(np.median(preds)) if len(preds) else 0.0
-        label = (preds > thr).astype(int)
-        arr = np.column_stack([preds, label])
-    return arr
+    # Expect stage2 output as a single numeric column (prob/score)
+    preds = data[:, 0].astype(float)
+    thr = float(np.median(preds)) if len(preds) else 0.0
+    labels = (preds >= thr).astype(int)
+    return np.column_stack([preds, labels])
 
 def output_fn(prediction, accept):
-    accept = (accept or "*/*").lower()
-
+    # Output CSV: pred,label
     out = io.StringIO()
     pd.DataFrame(prediction).to_csv(out, header=False, index=False)
-    body = out.getvalue()
-
-    # If Batch Transform asks for JSON, return CSV body but mark json
-    if "json" in accept:
-        return body, "application/json"
-
-    return body, "text/csv"
+    return out.getvalue(), "text/csv"
 '''
+with open(os.path.join(post_src_dir, "inference.py"), "w") as f:
+    f.write(post_inference_py)
 
-# 2) Write files into /code
-post_entry = os.path.join(code_dir, "inference.py")
-with open(post_entry, "w") as f:
-    f.write(inference_py)
+# --- Build model.tar.gz (can be "empty model" + inference.py at root) ---
+post_tar_path = f"/tmp/postprocess-model-{run_id}.tar.gz"
+with tarfile.open(post_tar_path, "w:gz") as tar:
+    tar.add(os.path.join(post_src_dir, "inference.py"), arcname="inference.py")
 
-init_path = os.path.join(code_dir, "__init__.py")
-with open(init_path, "w") as f:
-    f.write("")
+# --- Upload to S3 ---
+post_s3_key = f"{key_prefix}/postprocess/postprocess-model-{run_id}.tar.gz"
+s3.upload_file(post_tar_path, bucket, post_s3_key)
 
-with open(os.path.join(post_dir, "config.txt"), "w") as f:
-    f.write("postprocess=v1\n")
-
-# 3) Create model tar.gz with correct layout
-post_tar = "/tmp/postprocess-model.tar.gz"
-with tarfile.open(post_tar, "w:gz") as tar:
-    tar.add(post_entry, arcname="code/inference.py")
-    tar.add(init_path, arcname="code/__init__.py")
-    tar.add(os.path.join(post_dir, "config.txt"), arcname="config.txt")
-
-post_s3 = sess.upload_data(post_tar, bucket=bucket, key_prefix=f"{prefix}/artifacts/postprocess")
-print("stage3 model.tar.gz:", post_s3)
+stage3_model_data_url = f"s3://{bucket}/{post_s3_key}"
+print("✅ Stage3 model_data_url:", stage3_model_data_url)
+print("✅ Local tar:", post_tar_path, "size:", os.path.getsize(post_tar_path), "bytes")
 cell6: 
 from botocore.exceptions import ClientError
 
