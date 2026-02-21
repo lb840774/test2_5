@@ -180,32 +180,16 @@ with open(pre_entry, "w") as f:
 print("Wrote stage1 inference script:", pre_entry)
 
 cell5: 
-# ==========================
-# CELL 5 — STAGE 3 (POSTPROCESS)
-# ==========================
-
 import os, io, tarfile
 import numpy as np
 import pandas as pd
 
 # --- Minimal artifact required by SageMaker
 post_dir = "/tmp/postprocess_model"
-os.makedirs(post_dir, exist_ok=True)
-with open(f"{post_dir}/config.txt", "w") as f:
-    f.write("postprocess=v1\n")
+code_dir = os.path.join(post_dir, "code")
+os.makedirs(code_dir, exist_ok=True)
 
-post_tar = "/tmp/postprocess-model.tar.gz"
-with tarfile.open(post_tar, "w:gz") as tar:
-    tar.add(f"{post_dir}/config.txt", arcname="config.txt")
-
-post_s3 = sess.upload_data(post_tar, bucket=bucket, key_prefix=f"{prefix}/artifacts/postprocess")
-print("stage3 model.tar.gz:", post_s3)
-
-# --- Write inference script
-post_src_dir = "/tmp/postprocess_src"
-os.makedirs(post_src_dir, exist_ok=True)
-post_entry = os.path.join(post_src_dir, "inference.py")
-
+# 1) Define inference code FIRST
 inference_py = r'''
 import io
 import json
@@ -215,67 +199,74 @@ import pandas as pd
 def model_fn(model_dir):
     return {"ok": True}
 
-def _preds_from_csv(body):
-    s = body.decode("utf-8") if isinstance(body, (bytes, bytearray)) else str(body)
-    df = pd.read_csv(io.StringIO(s), header=None)
-    # Expect first column to be prediction score
-    return df.iloc[:, 0].astype(float).values
-
-def _preds_from_jsonlines(body):
-    s = body.decode("utf-8") if isinstance(body, (bytes, bytearray)) else str(body)
-    preds = []
-    for line in s.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        obj = json.loads(line)
-
-        # Try common keys first
-        if isinstance(obj, dict):
-            for k in ["score", "predicted_label", "prediction", "probability"]:
-                if k in obj and isinstance(obj[k], (int, float)):
-                    preds.append(float(obj[k]))
-                    break
-            else:
-                # fallback: first numeric value in dict
-                for v in obj.values():
-                    if isinstance(v, (int, float)):
-                        preds.append(float(v))
-                        break
-        elif isinstance(obj, (int, float)):
-            preds.append(float(obj))
-        elif isinstance(obj, list) and len(obj) > 0 and isinstance(obj[0], (int, float)):
-            preds.append(float(obj[0]))
-
-    return np.array(preds, dtype=float)
-
 def input_fn(request_body, request_content_type):
     ct = (request_content_type or "").lower()
 
-    # LinearLearner commonly returns jsonlines in pipeline mode
+    # Batch Transform often sends application/jsonlines
     if "jsonlines" in ct:
-        return _preds_from_jsonlines(request_body)
+        s = request_body.decode("utf-8") if isinstance(request_body, (bytes, bytearray)) else request_body
+        # parse JSONL -> list of records
+        recs = [json.loads(line) for line in s.strip().splitlines() if line.strip()]
+        # Expect each record to be a list/array of features
+        arr = np.array(recs, dtype=float)
+        return arr
 
-    if "csv" in ct or "application/x-csv" in ct:
-        return _preds_from_csv(request_body)
-
-    if "json" in ct:
-        # could be JSON array or similar; try as jsonlines fallback
-        return _preds_from_jsonlines(request_body)
+    if ct in ("text/csv", "application/x-csv"):
+        s = request_body.decode("utf-8") if isinstance(request_body, (bytes, bytearray)) else request_body
+        df = pd.read_csv(io.StringIO(s), header=None)
+        # expect first col contains prediction score
+        preds = df.iloc[:, 0].astype(float).values
+        return preds
 
     raise ValueError(f"Unsupported content type: {request_content_type}")
 
-def predict_fn(preds, model):
-    # Create 10x3 output: [pred_score, label, threshold]
-    thr = float(np.median(preds)) if len(preds) else 0.0
-    label = (preds > thr).astype(int)
-    thr_col = np.full_like(preds, thr, dtype=float)
-    return np.column_stack([preds.astype(float), label.astype(int), thr_col])
+def predict_fn(data, model):
+    # If stage3 receives preds (1D), make (pred,label)
+    if isinstance(data, np.ndarray) and data.ndim == 2:
+        # if someone sends 2D already, pass through
+        arr = data
+    else:
+        preds = np.array(data, dtype=float).reshape(-1)
+        thr = float(np.median(preds)) if len(preds) else 0.0
+        label = (preds > thr).astype(int)
+        arr = np.column_stack([preds, label])
+    return arr
 
 def output_fn(prediction, accept):
-    # Return CSV (safe for Batch Transform)
+    accept = (accept or "*/*").lower()
+
     out = io.StringIO()
-   
+    pd.DataFrame(prediction).to_csv(out, header=False, index=False)
+    body = out.getvalue()
+
+    # If Batch Transform asks for JSON, return CSV body but mark json
+    if "json" in accept:
+        return body, "application/json"
+
+    return body, "text/csv"
+'''
+
+# 2) Write files into /code
+post_entry = os.path.join(code_dir, "inference.py")
+with open(post_entry, "w") as f:
+    f.write(inference_py)
+
+init_path = os.path.join(code_dir, "__init__.py")
+with open(init_path, "w") as f:
+    f.write("")
+
+with open(os.path.join(post_dir, "config.txt"), "w") as f:
+    f.write("postprocess=v1\n")
+
+# 3) Create model tar.gz with correct layout
+post_tar = "/tmp/postprocess-model.tar.gz"
+with tarfile.open(post_tar, "w:gz") as tar:
+    tar.add(post_entry, arcname="code/inference.py")
+    tar.add(init_path, arcname="code/__init__.py")
+    tar.add(os.path.join(post_dir, "config.txt"), arcname="config.txt")
+
+post_s3 = sess.upload_data(post_tar, bucket=bucket, key_prefix=f"{prefix}/artifacts/postprocess")
+print("stage3 model.tar.gz:", post_s3)
 cell6: 
 from botocore.exceptions import ClientError
 
