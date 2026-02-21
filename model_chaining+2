@@ -32,40 +32,6 @@ print("prefix:", prefix)
 print("role:", role)
 
 cell2: 
-import os
-import json
-import time
-import tarfile
-import tempfile
-from pathlib import Path
-
-import boto3
-import numpy as np
-import pandas as pd
-import joblib
-
-import sagemaker
-from sagemaker import image_uris
-from sagemaker.model import Model
-from sagemaker.pipeline import PipelineModel
-
-sess = sagemaker.Session()
-region = sess.boto_region_name
-role = sagemaker.get_execution_role()
-
-s3 = boto3.client("s3")
-sm = boto3.client("sagemaker", region_name=region)
-
-bucket = sess.default_bucket()
-prefix = "three-stage-lr-pipeline-demo"
-
-print("region:", region)
-print("bucket:", bucket)
-print("prefix:", prefix)
-print("role:", role)
-
-
-cell3: 
 np.random.seed(42)
 
 n = 2000
@@ -99,7 +65,8 @@ print("train:", train_path, train.shape)
 print("test features:", test_path, test_features.shape)
 train.head()
 
-cell4: 
+
+cell3: 
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 
@@ -130,7 +97,7 @@ print("Stage1 AUC:", auc1)
 print("Stage2 AUC:", auc2)
 print("Stage3 AUC:", auc3)
 
-cell5: 
+cell4: 
 INFERENCE_STAGE1 = r"""
 import io
 import os
@@ -232,7 +199,7 @@ def output_fn(pred_df, accept):
 """
 print("inference scripts ready")
 
-cell6: 
+cell5: 
 def build_model_tar(stage_name: str, model_obj, inference_py: str, out_dir: Path) -> Path:
     out_dir.mkdir(exist_ok=True, parents=True)
     stage_dir = out_dir / stage_name
@@ -262,7 +229,7 @@ print("Built:", tar1)
 print("Built:", tar2)
 print("Built:", tar3)
 
-cell7: 
+cell6: 
 def s3_upload(local_path: Path, s3_key: str) -> str:
     s3.upload_file(str(local_path), bucket, s3_key)
     return f"s3://{bucket}/{s3_key}"
@@ -278,7 +245,7 @@ print("stage2:", s3_stage2)
 print("stage3:", s3_stage3)
 print("test:", s3_test)
 
-cell8: 
+cell7: 
 framework = "sklearn"
 framework_version = "1.2-1"  # good common default on SageMaker
 inference_image = image_uris.retrieve(framework=framework, region=region, version=framework_version, instance_type="ml.m5.large")
@@ -350,7 +317,8 @@ print("mp2:", mp2_arn)
 print("mp3:", mp3_arn)
 print("chain_id:", chain_id)
 
-cell9: 
+
+cell8: 
 timestamp = int(time.time())
 base_name = f"three-stage-lr-{timestamp}"
 
@@ -402,7 +370,7 @@ pipeline_model = PipelineModel(
 
 print("PipelineModel ready:", pipeline_model_name)
 
-cell10: 
+cell9: 
 transform_job_name = f"{base_name}-bt"
 
 output_s3 = f"s3://{bucket}/{prefix}/output/{transform_job_name}/"
@@ -426,4 +394,21 @@ transformer.transform(
 )
 transformer.wait()
 print("Done. Output:", output_s3)
+cell10: 
+# Batch output usually ends up as something like: output/<filename>.out
+# We'll list the output prefix and pull the first object.
+out_prefix = f"{prefix}/output/{transform_job_name}/"
+resp = s3.list_objects_v2(Bucket=bucket, Prefix=out_prefix)
+
+keys = [o["Key"] for o in resp.get("Contents", [])]
+print("Output keys:")
+for k in keys:
+    print(" -", k)
+
+out_key = [k for k in keys if k.endswith(".out") or k.endswith("test_features.csv.out") or k.endswith("test_features.csv")][0]
+local_out = Path("./local_data/pipeline_output.csv")
+s3.download_file(bucket, out_key, str(local_out))
+
+print("Downloaded:", local_out)
+pd.read_csv(local_out, header=None).head(10)
 
