@@ -1,0 +1,273 @@
+import os, json, time, tarfile, tempfile, pathlib, random
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+from sklearn.datasets import make_classification
+from sklearn.linear_model import LogisticRegression
+import joblib
+
+import boto3
+import sagemaker
+from sagemaker import image_uris
+from sagemaker.sklearn.model import SKLearnModel
+from sagemaker.pipeline import PipelineModel
+
+# ----------------------------
+# 0) Session / config
+# ----------------------------
+sess = sagemaker.Session()
+region = sess.boto_region_name
+role = sagemaker.get_execution_role()
+sm = boto3.client("sagemaker", region_name=region)
+
+bucket = sess.default_bucket()
+prefix = f"serial-infer-pipeline-demo/{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
+print("bucket:", bucket)
+print("prefix:", prefix)
+print("region:", region)
+
+framework_version = "1.2-1"  # common SageMaker sklearn serving version (adjust if your account/region needs)
+instance_type = "ml.m5.large"  # for batch transform
+
+# ----------------------------
+# 1) Create synthetic data + train 3 models locally
+#    Pipeline feature flow:
+#      model1: X -> [X, p1]
+#      model2: [X, p1] -> [X, p1, p2]
+#      model3: [X, p1, p2] -> final prediction/prob
+# ----------------------------
+rng = np.random.RandomState(42)
+
+X, y = make_classification(
+    n_samples=2000,
+    n_features=10,
+    n_informative=6,
+    n_redundant=2,
+    n_clusters_per_class=2,
+    random_state=42
+)
+
+m1 = LogisticRegression(max_iter=500).fit(X, y)
+p1 = m1.predict_proba(X)[:, 1:2]
+X2 = np.concatenate([X, p1], axis=1)
+
+m2 = LogisticRegression(max_iter=500).fit(X2, y)
+p2 = m2.predict_proba(X2)[:, 1:2]
+X3 = np.concatenate([X, p1, p2], axis=1)
+
+m3 = LogisticRegression(max_iter=500).fit(X3, y)
+
+print("trained models: m1, m2, m3")
+
+# ----------------------------
+# 2) Package each model into model.tar.gz and upload to S3
+# ----------------------------
+def make_model_tar_gz(model_obj, out_s3_key: str):
+    with tempfile.TemporaryDirectory() as d:
+        d = pathlib.Path(d)
+        joblib.dump(model_obj, d / "model.joblib")
+        tar_path = d / "model.tar.gz"
+        with tarfile.open(tar_path, "w:gz") as tar:
+            tar.add(d / "model.joblib", arcname="model.joblib")
+        s3_uri = sess.upload_data(str(tar_path), bucket=bucket, key_prefix=out_s3_key)
+        return s3_uri
+
+m1_s3 = make_model_tar_gz(m1, f"{prefix}/artifacts/model1")
+m2_s3 = make_model_tar_gz(m2, f"{prefix}/artifacts/model2")
+m3_s3 = make_model_tar_gz(m3, f"{prefix}/artifacts/model3")
+print("model artifacts:", m1_s3, m2_s3, m3_s3, sep="\n  ")
+
+# ----------------------------
+# 3) Write 3 inference scripts (one per container)
+#    Each container reads CSV, outputs CSV for next container.
+# ----------------------------
+def write_inference_script(path: str, stage: int):
+    code = f"""
+import io
+import numpy as np
+import joblib
+
+def model_fn(model_dir):
+    return joblib.load(f"{{model_dir}}/model.joblib")
+
+def input_fn(request_body, request_content_type):
+    # Expect text/csv with no header
+    if request_content_type != "text/csv":
+        raise ValueError(f"Unsupported content type: {{request_content_type}}")
+    data = np.loadtxt(io.StringIO(request_body), delimiter=",")
+    if data.ndim == 1:
+        data = data.reshape(1, -1)
+    return data
+
+def predict_fn(data, model):
+    # stage {stage} behavior:
+    #  1) input X -> output [X, p1]
+    #  2) input [X, p1] -> output [X, p1, p2]
+    #  3) input [X, p1, p2] -> output final prob and class
+    if {stage} in (1,2):
+        p = model.predict_proba(data)[:, 1:2]
+        out = np.concatenate([data, p], axis=1)
+        return out
+    else:
+        prob = model.predict_proba(data)[:, 1:2]
+        pred = (prob >= 0.5).astype(np.int64)
+        out = np.concatenate([prob, pred], axis=1)  # [prob, class]
+        return out
+
+def output_fn(prediction, response_content_type):
+    if response_content_type != "text/csv":
+        raise ValueError(f"Unsupported accept type: {{response_content_type}}")
+    # Return CSV with no header
+    buf = io.StringIO()
+    np.savetxt(buf, prediction, delimiter=",", fmt="%.6f")
+    return buf.getvalue(), response_content_type
+"""
+    with open(path, "w") as f:
+        f.write(code)
+
+tmp_src = tempfile.mkdtemp()
+src1 = os.path.join(tmp_src, "stage1"); os.makedirs(src1, exist_ok=True)
+src2 = os.path.join(tmp_src, "stage2"); os.makedirs(src2, exist_ok=True)
+src3 = os.path.join(tmp_src, "stage3"); os.makedirs(src3, exist_ok=True)
+
+write_inference_script(os.path.join(src1, "inference.py"), stage=1)
+write_inference_script(os.path.join(src2, "inference.py"), stage=2)
+write_inference_script(os.path.join(src3, "inference.py"), stage=3)
+
+# ----------------------------
+# 4) Create 3 SKLearnModel objects and chain them into a PipelineModel
+# ----------------------------
+model1 = SKLearnModel(
+    model_data=m1_s3, role=role, entry_point="inference.py", source_dir=src1,
+    framework_version=framework_version, sagemaker_session=sess
+)
+model2 = SKLearnModel(
+    model_data=m2_s3, role=role, entry_point="inference.py", source_dir=src2,
+    framework_version=framework_version, sagemaker_session=sess
+)
+model3 = SKLearnModel(
+    model_data=m3_s3, role=role, entry_point="inference.py", source_dir=src3,
+    framework_version=framework_version, sagemaker_session=sess
+)
+
+pipeline_model_name = sagemaker.utils.name_from_base("lr-serial-pipeline")
+pipeline_model = PipelineModel(
+    name=pipeline_model_name,
+    role=role,
+    models=[model1, model2, model3],
+    sagemaker_session=sess
+)
+
+# Create the SageMaker "model" entity for the pipeline (needed for batch transform)
+pipeline_model.create(instance_type=instance_type)
+print("Created PipelineModel:", pipeline_model_name)
+
+# ----------------------------
+# 5) Prepare batch input (ONLY original X) and run batch transform
+# ----------------------------
+batch_in = pd.DataFrame(X[:200])  # small sample
+local_input = os.path.join(tmp_src, "batch_input.csv")
+batch_in.to_csv(local_input, header=False, index=False)
+
+input_s3 = sess.upload_data(local_input, bucket=bucket, key_prefix=f"{prefix}/batch/input")
+output_s3 = f"s3://{bucket}/{prefix}/batch/output"
+
+transformer = pipeline_model.transformer(
+    instance_count=1,
+    instance_type=instance_type,
+    output_path=output_s3,
+    assemble_with="Line",
+    accept="text/csv"
+)
+
+print("Starting batch transform...")
+transformer.transform(
+    data=input_s3,
+    content_type="text/csv",
+    split_type="Line",
+    wait=True,
+    logs=True
+)
+print("Batch output prefix:", output_s3)
+print("Output file(s) will contain: [final_prob, final_class] per row.")
+
+# ----------------------------
+# 6) Register each model into its own Model Package Group + link lineage
+#    - model2 package metadata includes upstream=model1_package_arn
+#    - model3 package metadata includes upstream=model2_package_arn
+#    - after creating model2/model3 packages, tag upstream packages with downstream arn
+# ----------------------------
+def ensure_package_group(group_name: str, desc: str):
+    try:
+        sm.describe_model_package_group(ModelPackageGroupName=group_name)
+        return
+    except sm.exceptions.ResourceNotFound:
+        sm.create_model_package_group(
+            ModelPackageGroupName=group_name,
+            ModelPackageGroupDescription=desc
+        )
+
+def create_package(group_name: str, model_data_url: str, stage: str, upstream_pkg_arn: str = ""):
+    # Use the official SKLearn serving image for the Model Registry inference spec
+    image_uri = image_uris.retrieve(
+        framework="sklearn",
+        region=region,
+        version=framework_version,
+        instance_type=instance_type,
+    )
+    customer_meta = {
+        "demo:serial_inference_stage": stage,
+        "demo:pipeline_logical_name": pipeline_model_name,
+        "demo:upstream_model_package_arn": upstream_pkg_arn or "",
+        "demo:created_utc": datetime.utcnow().isoformat() + "Z",
+    }
+    resp = sm.create_model_package(
+        ModelPackageGroupName=group_name,
+        ModelPackageDescription=f"Demo LR model for serial inference stage {stage}",
+        InferenceSpecification={
+            "Containers": [
+                {
+                    "Image": image_uri,
+                    "ModelDataUrl": model_data_url,
+                    "Environment": {}  # (optional) env vars for container
+                }
+            ],
+            "SupportedContentTypes": ["text/csv"],
+            "SupportedResponseMIMETypes": ["text/csv"],
+        },
+        ModelApprovalStatus="Approved",
+        CustomerMetadataProperties=customer_meta,
+    )
+    return resp["ModelPackageArn"]
+
+def add_tag(resource_arn: str, key: str, value: str):
+    sm.add_tags(ResourceArn=resource_arn, Tags=[{"Key": key, "Value": value}])
+
+base_group = sagemaker.utils.name_from_base("lr-serial-pkggrp")
+g1 = f"{base_group}-stage1"
+g2 = f"{base_group}-stage2"
+g3 = f"{base_group}-stage3"
+
+ensure_package_group(g1, "Demo package group for stage1 (X -> [X,p1])")
+ensure_package_group(g2, "Demo package group for stage2 ([X,p1] -> [X,p1,p2])")
+ensure_package_group(g3, "Demo package group for stage3 ([X,p1,p2] -> final)")
+
+pkg1 = create_package(g1, m1_s3, stage="1", upstream_pkg_arn="")
+pkg2 = create_package(g2, m2_s3, stage="2", upstream_pkg_arn=pkg1)
+pkg3 = create_package(g3, m3_s3, stage="3", upstream_pkg_arn=pkg2)
+
+# Add downstream tags after-the-fact (since stage1 didn't know stage2 at creation)
+add_tag(pkg1, "demo:downstream_model_package_arn", pkg2)
+add_tag(pkg2, "demo:downstream_model_package_arn", pkg3)
+
+print("\nModel Registry ARNs:")
+print("  stage1 package:", pkg1)
+print("  stage2 package:", pkg2)
+print("  stage3 package:", pkg3)
+
+print("\nLineage metadata:")
+print("  stage2 upstream ->", pkg1)
+print("  stage3 upstream ->", pkg2)
+print("  stage1 downstream tag ->", pkg2)
+print("  stage2 downstream tag ->", pkg3)
