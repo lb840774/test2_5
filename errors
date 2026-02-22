@@ -1,18 +1,147 @@
-import boto3, json, uuid
 
-rt = boto3.client("bedrock-agentcore", region_name="us-east-1")
 
-def invoke(payload: dict, qualifier=None):
-    kwargs = dict(
-        agentRuntimeArn=RUNTIME_ARN,
-        runtimeSessionId="sess-" + str(uuid.uuid4()) + "-" + str(uuid.uuid4()),
-        payload=json.dumps(payload).encode("utf-8"),
-        contentType="application/json",
-        accept="application/json",
-    )
-    if qualifier:
-        kwargs["qualifier"] = qualifier  # optional (for non-default endpoints)
+def model_fn(model_dir):
+    """
+    Load model artifact from model_dir. Expect: model.joblib
+    """
+    model_path = os.path.join(model_dir, "model.joblib")
+    print(f"[STAGE1] Loading model from: {model_path}")
+    model = joblib.load(model_path)
+    print("[STAGE1] Model loaded")
+    return model
 
-    resp = rt.invoke_agent_runtime(**kwargs)
-    body = resp["response"].read()
-    return json.loads(body.decode("utf-8"))
+
+def _parse_csv_to_2d_array(csv_text: str) -> np.ndarray:
+    """
+    Parses CSV that may contain:
+      - one column: f1
+      - or multiple columns
+    Returns a 2D numpy array.
+    """
+    # Remove empty lines
+    lines = [ln.strip() for ln in csv_text.splitlines() if ln.strip() != ""]
+    if not lines:
+        return np.empty((0, 0), dtype=float)
+
+    # If header exists, np.loadtxt can choke; we’ll try both ways.
+    buf = io.StringIO("\n".join(lines))
+
+    # Try no-header parse first
+    try:
+        arr = np.loadtxt(buf, delimiter=",", dtype=float)
+    except Exception:
+        # Retry assuming first row is header
+        buf = io.StringIO("\n".join(lines[1:]))
+        if len(lines) <= 1:
+            return np.empty((0, 0), dtype=float)
+        arr = np.loadtxt(buf, delimiter=",", dtype=float)
+
+    arr = np.asarray(arr)
+
+    # Ensure 2D
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+
+    return arr
+
+
+def input_fn(request_body, request_content_type):
+    """
+    Convert incoming payload -> 2D numpy array for sklearn.
+    Supports:
+      - text/csv
+      - application/json  (expects {"instances": [[...],[...]]} or [[...],[...]] )
+      - application/jsonlines (one JSON per line)
+    """
+    ct = (request_content_type or "").lower()
+    print(f"[STAGE1] input_fn content-type: {ct}")
+
+    # bytes -> str
+    body_str = request_body.decode("utf-8") if isinstance(request_body, (bytes, bytearray)) else str(request_body)
+
+    # CSV
+    if "text/csv" in ct or ct == "text/plain":
+        arr = _parse_csv_to_2d_array(body_str)
+        print(f"[STAGE1] parsed CSV shape: {arr.shape}")
+        return arr
+
+    # JSON
+    if "application/json" in ct:
+        obj = json.loads(body_str)
+
+        # allow {"instances": ...} or direct list
+        if isinstance(obj, dict) and "instances" in obj:
+            obj = obj["instances"]
+
+        arr = np.asarray(obj, dtype=float)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        print(f"[STAGE1] parsed JSON shape: {arr.shape}")
+        return arr
+
+    # JSONLines
+    if "jsonlines" in ct or "application/jsonl" in ct:
+        rows = []
+        for line in body_str.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+        arr = np.asarray(rows, dtype=float)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        print(f"[STAGE1] parsed JSONLines shape: {arr.shape}")
+        return arr
+
+    raise ValueError(f"[STAGE1] Unsupported content type: {request_content_type}")
+
+
+def predict_fn(input_data, model):
+    """
+    Run inference. MUST NOT return None.
+    Returns a 1D numpy array of predictions.
+    """
+    arr = np.asarray(input_data)
+
+    # Empty input -> return empty array (NOT None)
+    if arr.size == 0:
+        print("[STAGE1] EMPTY input -> returning empty preds")
+        return np.array([], dtype=float)
+
+    # Ensure 2D for sklearn
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+
+    # Prefer probability of class 1 if available
+    if hasattr(model, "predict_proba"):
+        preds = model.predict_proba(arr)[:, 1]
+    else:
+        preds = model.predict(arr)
+
+    preds = np.asarray(preds).reshape(-1)
+    print(f"[STAGE1] preds shape: {preds.shape}")
+    return preds
+
+
+def output_fn(prediction, accept="text/csv"):
+    """
+    Batch Transform expects BYTES or STRING. NEVER return None.
+    We output one prediction per line as CSV.
+    """
+    accept = (accept or "text/csv").lower()
+
+    if prediction is None:
+        print("[STAGE1] prediction is None -> returning empty output")
+        return "" if accept.startswith("text/") else b""
+
+    arr = np.asarray(prediction).reshape(-1)
+
+    if arr.size == 0:
+        print("[STAGE1] prediction empty -> returning empty output")
+        return "" if accept.startswith("text/") else b""
+
+    out = "\n".join(str(x) for x in arr) + "\n"
+
+    if accept.startswith("text/"):
+        return out
+    return out.encode("utf-8")
