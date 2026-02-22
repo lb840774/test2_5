@@ -1,18 +1,22 @@
-  # SageMaker sometimes sends application/json or adds charset to text/csv
-    if response_content_type is None:
-        response_content_type = "text/csv"
+collection_name = "lr-serial-pipeline-collection"
 
-    rct = response_content_type.lower()
+# Create collection if needed
+try:
+    sm.create_model_package_group_collection(
+        ModelPackageGroupCollectionName=collection_name,
+        ModelPackageGroupCollectionDescription="Serial inference pipeline collection"
+    )
+    print("Collection created")
+except sm.exceptions.ResourceInUse:
+    print("Collection already exists")
 
-    if rct.startswith("application/json"):
-        response_content_type = "text/csv"
-
-    if rct.startswith("text/csv"):
-        response_content_type = "text/csv"
-
-    if response_content_type != "text/csv":
-        raise ValueError(f"Unsupported accept type: {response_content_type}")
-
-    buf = io.StringIO()
-    np.savetxt(buf, prediction, delimiter=",", fmt="%.6f")
-    return buf.getvalue(), "text/csv"
+# Add groups to collection
+for group_name in [g1, g2, g3]:
+    try:
+        sm.create_model_package_group_collection_membership(
+            ModelPackageGroupCollectionName=collection_name,
+            ModelPackageGroupName=group_name
+        )
+        print(f"Added {group_name} to collection")
+    except sm.exceptions.ResourceInUse:
+        print(f"{group_name} already in collection")
