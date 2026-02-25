@@ -1,6 +1,41 @@
 cid: LgzUtX228RiHzo4pOmgTtbye3eOcDcnD
 csec: 1PrXd8lLUHyqBL0EPMqm_1dFmTHJS5QhlZDIOVxmNxK5YhpBVl5-GdDBW8t71GW8
 
+import requests, json
+
+# 1) Pull token_endpoint from discovery doc you already validated
+disco = requests.get(AUTH0_WELL_KNOWN, timeout=10).json()
+token_endpoint = disco["token_endpoint"]
+print("token_endpoint:", token_endpoint)
+
+# 2) Make the exact client_credentials call
+payload = {
+    "grant_type": "client_credentials",
+    "client_id": AUTH0_CLIENT_ID,
+    "client_secret": AUTH0_CLIENT_SECRET,
+    # Auth0 typically uses "audience". Okta often uses "scope" + issuer-specific token endpoint.
+    "audience": AUTH0_AUDIENCE,
+}
+
+# If you have scopes, they must be SPACE separated for OAuth
+if OAUTH_SCOPES:
+    payload["scope"] = " ".join(OAUTH_SCOPES) if isinstance(OAUTH_SCOPES, (list, tuple)) else str(OAUTH_SCOPES)
+
+r = requests.post(token_endpoint, data=payload, timeout=15)
+print("status:", r.status_code)
+print("content-type:", r.headers.get("content-type"))
+print("body (first 800 chars):\n", r.text[:800])
+
+# If JSON, print keys
+try:
+    j = r.json()
+    print("json keys:", list(j.keys()))
+except Exception:
+    pass
+
+
+
+
 import inspect
 
 # 1) Extract your workload JWT (agent identity token) as a STRING
