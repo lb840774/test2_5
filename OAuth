@@ -1,25 +1,21 @@
 cid: LgzUtX228RiHzo4pOmgTtbye3eOcDcnD
 csec: 1PrXd8lLUHyqBL0EPMqm_1dFmTHJS5QhlZDIOVxmNxK5YhpBVl5-GdDBW8t71GW8
 
-import socket, requests
+import requests
 
-tests = [
-    "example.com",
-    "google.com",
-    "dev-3nbp7mornmisbyoo.us.auth0.com",
-]
+token_url = f"https://{AUTH0_DOMAIN}/oauth/token"
 
-for host in tests:
-    try:
-        print(host, "->", socket.gethostbyname(host))
-    except Exception as e:
-        print(host, "DNS FAIL:", repr(e))
+payload = {
+    "client_id": AUTH0_CLIENT_ID,
+    "client_secret": AUTH0_CLIENT_SECRET,
+    "audience": AUTH0_AUDIENCE,
+    "grant_type": "client_credentials"
+}
 
-try:
-    r = requests.get("https://example.com", timeout=10)
-    print("HTTPS example.com:", r.status_code, r.headers.get("content-type"))
-except Exception as e:
-    print("HTTPS FAIL:", repr(e))
+r = requests.post(token_url, json=payload, timeout=10)
+
+print("status:", r.status_code)
+print("response:", r.json())
 
 
 cell1: 
