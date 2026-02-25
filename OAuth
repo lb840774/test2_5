@@ -6,24 +6,36 @@ csec: 1PrXd8lLUHyqBL0EPMqm_1dFmTHJS5QhlZDIOVxmNxK5YhpBVl5-GdDBW8t71GW8
 import json, requests, jwt
 from jwt.algorithms import RSAAlgorithm
 
-AUTH0_DOMAIN = AUTH0_DOMAIN  # from your config
-JWKS_URL = f"https://{AUTH0_DOMAIN}/.well-known/jwks.json"
+# token_resp is whatever came back from identity.get_token(...)
+# Example: token_resp = identity.get_token(...)
 
-# this is the token you minted via identity.get_token(...)
-# auth0_access_token = ...
+# 1) Extract the actual JWT string
+auth0_access_token = (
+    token_resp.get("access_token")
+    or token_resp.get("accessToken")
+    or token_resp.get("token")
+    or token_resp.get("AccessToken")
+)
 
-jwks = requests.get(JWKS_URL, timeout=10).json()
-unverified_header = jwt.get_unverified_header(auth0_access_token)
-kid = unverified_header["kid"]
+if not isinstance(auth0_access_token, str):
+    raise ValueError(f"Couldn't find access token string. token_resp keys={list(token_resp.keys())}")
 
+print("Token starts with:", auth0_access_token[:20])
+
+# 2) Fetch JWKS + pick the signing key
+jwks_url = f"https://{AUTH0_DOMAIN}/.well-known/jwks.json"
+jwks = requests.get(jwks_url, timeout=10).json()
+
+kid = jwt.get_unverified_header(auth0_access_token)["kid"]
 jwk = next(k for k in jwks["keys"] if k["kid"] == kid)
 public_key = RSAAlgorithm.from_jwk(json.dumps(jwk))
 
+# 3) Verify signature + claims
 claims = jwt.decode(
     auth0_access_token,
     public_key,
     algorithms=["RS256"],
-    audience=AUTH0_AUDIENCE,                 # e.g. "https://agent-core-test-api"
+    audience=AUTH0_AUDIENCE,
     issuer=f"https://{AUTH0_DOMAIN}/",
 )
 
@@ -32,8 +44,6 @@ print("iss:", claims.get("iss"))
 print("aud:", claims.get("aud"))
 print("scope:", claims.get("scope"))
 print("exp:", claims.get("exp"))
-
-
 
 
 import json, requests, jwt
