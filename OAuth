@@ -1,6 +1,26 @@
 cid: LgzUtX228RiHzo4pOmgTtbye3eOcDcnD
 csec: 1PrXd8lLUHyqBL0EPMqm_1dFmTHJS5QhlZDIOVxmNxK5YhpBVl5-GdDBW8t71GW8
 
+import socket, requests
+
+tests = [
+    "example.com",
+    "google.com",
+    "dev-3nbp7mornmisbyoo.us.auth0.com",
+]
+
+for host in tests:
+    try:
+        print(host, "->", socket.gethostbyname(host))
+    except Exception as e:
+        print(host, "DNS FAIL:", repr(e))
+
+try:
+    r = requests.get("https://example.com", timeout=10)
+    print("HTTPS example.com:", r.status_code, r.headers.get("content-type"))
+except Exception as e:
+    print("HTTPS FAIL:", repr(e))
+
 
 cell1: 
 %pip install -q bedrock-agentcore boto3 requests
