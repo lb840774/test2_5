@@ -1,6 +1,71 @@
 cid: LgzUtX228RiHzo4pOmgTtbye3eOcDcnD
 csec: 1PrXd8lLUHyqBL0EPMqm_1dFmTHJS5QhlZDIOVxmNxK5YhpBVl5-GdDBW8t71GW8
 
+import inspect
+
+# 0) Make sure workload_jwt is a plain string (JWT)
+workload_jwt = (
+    workload_access_token.get("workloadAccessToken")
+    or workload_access_token.get("workload_access_token")
+    or workload_access_token.get("token")
+    or workload_access_token.get("accessToken")
+)
+assert isinstance(workload_jwt, str) and len(workload_jwt) > 20, f"Bad workload_jwt: {type(workload_jwt)} len={len(workload_jwt) if isinstance(workload_jwt,str) else 'n/a'}"
+
+# 1) Build kwargs that match *your* IdentityClient.get_token() signature
+sig = inspect.signature(identity.get_token)
+params = set(sig.parameters.keys())
+print("get_token params:", params)
+
+kwargs = {}
+
+# workload token param name
+if "workload_access_token" in params:
+    kwargs["workload_access_token"] = workload_jwt
+elif "workloadAccessToken" in params:
+    kwargs["workloadAccessToken"] = workload_jwt
+else:
+    raise RuntimeError("Could not find workload access token parameter name for identity.get_token()")
+
+# provider name param name
+if "provider_name" in params:
+    kwargs["provider_name"] = PROVIDER_NAME
+elif "providerName" in params:
+    kwargs["providerName"] = PROVIDER_NAME
+else:
+    raise RuntimeError("Could not find provider name parameter name for identity.get_token()")
+
+# scopes param name (optional)
+if "scopes" in params:
+    kwargs["scopes"] = OAUTH_SCOPES
+
+# custom params name (optional)
+custom = {"audience": AUTH0_AUDIENCE}
+if "custom_parameters" in params:
+    kwargs["custom_parameters"] = custom
+elif "customParameters" in params:
+    kwargs["customParameters"] = custom
+
+print("Calling get_token with kwargs:", kwargs)
+
+# 2) Call + await if needed
+token_resp = identity.get_token(**kwargs)
+if inspect.iscoroutine(token_resp):
+    token_resp = await token_resp
+
+print("token_resp type:", type(token_resp))
+print("token_resp keys:", list(token_resp.keys()) if hasattr(token_resp, "keys") else token_resp)
+
+# 3) Extract the access token (handle common key variants)
+auth_access_token = (
+    token_resp.get("access_token")
+    or token_resp.get("accessToken")
+    or token_resp.get("token")
+    or token_resp.get("AccessToken")
+)
+print("auth_access_token starts:", auth_access_token[:25] if auth_access_token else None)
+
+
 
 
 import json, requests, jwt
