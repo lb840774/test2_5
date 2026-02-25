@@ -1,3 +1,7 @@
+cid: LgzUtX228RiHzo4pOmgTtbye3eOcDcnD
+csec: 1PrXd8lLUHyqBL0EPMqm_1dFmTHJS5QhlZDIOVxmNxK5YhpBVl5-GdDBW8t71GW8
+
+
 cell1: 
 %pip install -q bedrock-agentcore boto3 requests
 
