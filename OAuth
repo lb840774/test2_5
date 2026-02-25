@@ -36,10 +36,11 @@ print("Audience:", AUTH0_AUDIENCE)
 cell3: 
 import requests
 
-disc = requests.get(AUTH0_WELL_KNOWN, timeout=10).json()
-print("issuer:", disc.get("issuer"))
-print("token_endpoint:", disc.get("token_endpoint"))
-print("jwks_uri:", disc.get("jwks_uri"))
+resp = requests.get(AUTH0_WELL_KNOWN, timeout=10, allow_redirects=True)
+print("status:", resp.status_code)
+print("content-type:", resp.headers.get("content-type"))
+print("final url:", resp.url)
+print("first 300 chars:\n", resp.text[:300])
 
 
 cell4: 
