@@ -1,6 +1,30 @@
 cid: LgzUtX228RiHzo4pOmgTtbye3eOcDcnD
 csec: 1PrXd8lLUHyqBL0EPMqm_1dFmTHJS5QhlZDIOVxmNxK5YhpBVl5-GdDBW8t71GW8
 
+
+import asyncio
+from bedrock_agentcore.identity.auth import requires_access_token
+
+PROVIDER_NAME = "auth0-central-provider-smoke"   # <-- must match what you created
+SCOPES = ["read:test"]                            # or [] if you want no scopes
+
+@requires_access_token(
+    provider_name=PROVIDER_NAME,
+    scopes=SCOPES,
+    auth_flow="M2M",     # machine-to-machine (client credentials)
+)
+async def show_token(*, access_token: str):
+    print("Got access token len:", len(access_token))
+    print("Token preview:", access_token[:25], "...")
+
+asyncio.run(show_token())
+
+
+
+
+
+
+
 import inspect, asyncio
 
 # 1) Extract the workload JWT string (this part stays)
