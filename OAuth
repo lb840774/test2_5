@@ -1,6 +1,56 @@
 cid: LgzUtX228RiHzo4pOmgTtbye3eOcDcnD
 csec: 1PrXd8lLUHyqBL0EPMqm_1dFmTHJS5QhlZDIOVxmNxK5YhpBVl5-GdDBW8t71GW8
 
+
+
+import base64, json
+
+def b64url_decode(s: str) -> bytes:
+    s += "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s.encode())
+
+def inspect_token(tok):
+    print("Python type:", type(tok))
+    if isinstance(tok, dict):
+        print("Dict keys:", list(tok.keys()))
+        # common places tokens hide
+        for k in ["workloadAccessToken", "access_token", "token", "id_token"]:
+            if k in tok:
+                print(f"\nFound '{k}' inside dict. Using that value.\n")
+                return inspect_token(tok[k])
+        return
+
+    if not isinstance(tok, str):
+        print("Not a string token. Value:", tok)
+        return
+
+    print("String length:", len(tok))
+    print("First 60 chars:", tok[:60])
+    print("Dot count:", tok.count("."))
+
+    parts = tok.split(".")
+    if len(parts) < 2:
+        print("\nThis is NOT a JWT (no header.payload).")
+        print("It might be an opaque token. You can't locally decode it; you just send it as Bearer.")
+        return
+
+    header = json.loads(b64url_decode(parts[0]))
+    payload = json.loads(b64url_decode(parts[1]))
+
+    print("\nHEADER:", json.dumps(header, indent=2))
+    print("\nPAYLOAD (selected):")
+    for k in ["iss","aud","sub","exp","iat","scope","azp","client_id"]:
+        if k in payload:
+            print(f"  {k}: {payload[k]}")
+
+# ---- run this ----
+inspect_token(workload_access_token)
+
+
+
+
+
+
 import base64, json
 
 def _b64url_decode(s: str) -> bytes:
