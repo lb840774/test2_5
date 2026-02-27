@@ -1,6 +1,27 @@
 cid: LgzUtX228RiHzo4pOmgTtbye3eOcDcnD
 csec: 1PrXd8lLUHyqBL0EPMqm_1dFmTHJS5QhlZDIOVxmNxK5YhpBVl5-GdDBW8t71GW8
 
+import base64, json
+
+def _b64url_decode(s: str) -> bytes:
+    s += "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s.encode())
+
+def peek_jwt(token: str):
+    header_b64, payload_b64, *_ = token.split(".")
+    header = json.loads(_b64url_decode(header_b64))
+    payload = json.loads(_b64url_decode(payload_b64))
+    print("HEADER:", json.dumps(header, indent=2))
+    print("\nPAYLOAD (selected):")
+    for k in ["iss","aud","sub","exp","iat","scope","azp","client_id"]:
+        if k in payload:
+            print(f"  {k}: {payload[k]}")
+
+token = workload_access_token["workloadAccessToken"]
+peek_jwt(token)
+
+
+
 
 import asyncio
 from bedrock_agentcore.identity.auth import requires_access_token
