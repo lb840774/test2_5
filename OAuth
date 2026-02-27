@@ -1,7 +1,127 @@
 cid: LgzUtX228RiHzo4pOmgTtbye3eOcDcnD
 csec: 1PrXd8lLUHyqBL0EPMqm_1dFmTHJS5QhlZDIOVxmNxK5YhpBVl5-GdDBW8t71GW8
 
+import asyncio
+from bedrock_agentcore.services.identity import IdentityClient
 
+identity = IdentityClient(region="us-east-1")
+
+async def mint_auth0_token():
+    # 1) workload token (opaque; for AgentCore Identity)
+    workload_resp = await identity.get_workload_access_token(workload_name=WORKLOAD_NAME)
+    agent_identity_token = workload_resp["workloadAccessToken"]
+
+    # 2) exchange for Auth0 token using your credential provider
+    auth0_access_token = await identity.get_token(
+        provider_name=PROVIDER_NAME,
+        scopes=["read:test"],
+        agent_identity_token=agent_identity_token,
+        auth_flow="M2M",
+        custom_parameters={"audience": AUTH0_AUDIENCE},
+    )
+
+    # Some SDKs return dict; normalize to string if needed
+    if isinstance(auth0_access_token, dict):
+        # common keys to try
+        auth0_access_token = (
+            auth0_access_token.get("access_token")
+            or auth0_access_token.get("token")
+            or auth0_access_token.get("AccessToken")
+            or str(auth0_access_token)
+        )
+
+    print("Auth0 token type:", type(auth0_access_token))
+    print("Auth0 token length:", len(auth0_access_token))
+    print("Has dots (JWT-like)?", auth0_access_token.count(".") == 2)
+    print("First 60 chars:", auth0_access_token[:60])
+
+    return auth0_access_token
+
+auth0_access_token = asyncio.run(mint_auth0_token())
+✅ Next cell: call your API with that token
+import requests
+
+API_URL = "https://<your-api-host>/test"   # <-- replace with your resource server endpoint
+
+r = requests.get(
+    API_URL,
+    headers={"Authorization": f"Bearer {auth0_access_token}"},
+    timeout=30
+)
+
+print("status:", r.status_code)
+print("content-type:", r.headers.get("content-type"))
+print("body (first 800):", r.text[:800])
+Why this happened (in one line)
+
+Your previous cell did:
+
+auth0_access_token = identity.get_token(...) ✅ but that returned a coroutine
+
+len(auth0_access_token) ❌ because it wasn’t awaited yet
+
+If you run the async cell and it errors again, send a screenshot of the traceback — the next most common issue is wrong arg name (auth_flow vs authFlow) depending on SDK version, and I’ll match it to your method signature.
+
+import asyncio
+from bedrock_agentcore.services.identity import IdentityClient
+
+identity = IdentityClient(region="us-east-1")
+
+async def mint_auth0_token():
+    # 1) workload token (opaque; for AgentCore Identity)
+    workload_resp = await identity.get_workload_access_token(workload_name=WORKLOAD_NAME)
+    agent_identity_token = workload_resp["workloadAccessToken"]
+
+    # 2) exchange for Auth0 token using your credential provider
+    auth0_access_token = await identity.get_token(
+        provider_name=PROVIDER_NAME,
+        scopes=["read:test"],
+        agent_identity_token=agent_identity_token,
+        auth_flow="M2M",
+        custom_parameters={"audience": AUTH0_AUDIENCE},
+    )
+
+    # Some SDKs return dict; normalize to string if needed
+    if isinstance(auth0_access_token, dict):
+        # common keys to try
+        auth0_access_token = (
+            auth0_access_token.get("access_token")
+            or auth0_access_token.get("token")
+            or auth0_access_token.get("AccessToken")
+            or str(auth0_access_token)
+        )
+
+    print("Auth0 token type:", type(auth0_access_token))
+    print("Auth0 token length:", len(auth0_access_token))
+    print("Has dots (JWT-like)?", auth0_access_token.count(".") == 2)
+    print("First 60 chars:", auth0_access_token[:60])
+
+    return auth0_access_token
+
+auth0_access_token = asyncio.run(mint_auth0_token())
+✅ Next cell: call your API with that token
+import requests
+
+API_URL = "https://<your-api-host>/test"   # <-- replace with your resource server endpoint
+
+r = requests.get(
+    API_URL,
+    headers={"Authorization": f"Bearer {auth0_access_token}"},
+    timeout=30
+)
+
+print("status:", r.status_code)
+print("content-type:", r.headers.get("content-type"))
+print("body (first 800):", r.text[:800])
+Why this happened (in one line)
+
+Your previous cell did:
+
+auth0_access_token = identity.get_token(...) ✅ but that returned a coroutine
+
+len(auth0_access_token) ❌ because it wasn’t awaited yet
+
+If you run the async cell and it errors again, send a screenshot of the traceback — the next most common issue is wrong arg name (auth_flow vs authFlow) depending on SDK version, and I’ll match it to your method signature.
 
 from bedrock_agentcore.services.identity import IdentityClient
 
