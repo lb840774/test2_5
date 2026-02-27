@@ -2,6 +2,69 @@ cid: LgzUtX228RiHzo4pOmgTtbye3eOcDcnD
 csec: 1PrXd8lLUHyqBL0EPMqm_1dFmTHJS5QhlZDIOVxmNxK5YhpBVl5-GdDBW8t71GW8
 
 
+import inspect
+from bedrock_agentcore.services.identity import IdentityClient
+
+identity = IdentityClient(region="us-east-1")
+
+for fn in [
+    "create_workload_identity",
+    "get_workload_identity",
+    "update_workload_identity",
+    "create_oauth2_credential_provider",
+    "get_workload_access_token",
+    "get_token",
+    "complete_resource_token_auth",
+]:
+    if hasattr(identity, fn):
+        print(f"\n=== {fn} ===")
+        try:
+            print(inspect.signature(getattr(identity, fn)))
+        except Exception as e:
+            print("Could not read signature:", e)
+
+
+
+
+
+from bedrock_agentcore.services.identity import IdentityClient
+import json
+
+identity = IdentityClient(region="us-east-1")
+
+wi = identity.get_workload_identity(WORKLOAD_NAME)  # positional
+print("Type:", type(wi))
+print(json.dumps(wi, indent=2, default=str)[:4000])  # print first chunk
+
+
+
+
+patch = {
+  # example keys — your Cell B output will tell the exact key names
+  "credentialProviderArn": PROVIDER_ARN,
+  # sometimes also:
+  # "credentialProviderName": PROVIDER_NAME,
+}
+resp = identity.update_workload_identity(WORKLOAD_NAME, patch)
+print(resp)
+
+
+
+
+resp = identity.update_workload_identity(WORKLOAD_NAME, credentialProviderArn=PROVIDER_ARN)
+print(resp)
+
+
+tok = identity.get_token(WORKLOAD_NAME)  # or get_token(workload, provider, audience, scope...) depending on signature
+print(tok)
+
+
+
+
+
+
+
+
 from bedrock_agentcore.services.identity import IdentityClient
 
 identity = IdentityClient(region="us-east-1")
