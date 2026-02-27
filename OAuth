@@ -2,6 +2,54 @@ cid: LgzUtX228RiHzo4pOmgTtbye3eOcDcnD
 csec: 1PrXd8lLUHyqBL0EPMqm_1dFmTHJS5QhlZDIOVxmNxK5YhpBVl5-GdDBW8t71GW8
 
 
+
+from bedrock_agentcore.services.identity import IdentityClient
+
+identity = IdentityClient(region="us-east-1")
+
+# 1) Get AgentCore workload token (opaque, for AgentCore Identity)
+workload_resp = identity.get_workload_access_token(workload_name=WORKLOAD_NAME)
+agent_identity_token = workload_resp["workloadAccessToken"]
+
+# 2) Exchange it for an Auth0 token using your credential provider
+# NOTE: provider_name must EXACTLY match the provider you created (console name).
+auth0_access_token = identity.get_token(
+    provider_name=PROVIDER_NAME,
+    scopes=["read:test"],                 # or whatever your API expects
+    agent_identity_token=agent_identity_token,
+    auth_flow="M2M",
+    custom_parameters={
+        "audience": AUTH0_AUDIENCE        # IMPORTANT for Auth0 APIs
+    }
+)
+
+print("Auth0 token length:", len(auth0_access_token))
+print("Has dots (JWT-like)?", auth0_access_token.count(".") == 2)
+print("First 50 chars:", auth0_access_token[:50])
+
+
+
+import requests
+
+API_URL = "https://<your-api-host>/test"   # <-- your resource server endpoint
+
+r = requests.get(
+    API_URL,
+    headers={"Authorization": f"Bearer {auth0_access_token}"},
+    timeout=30
+)
+
+print("status:", r.status_code)
+print("content-type:", r.headers.get("content-type"))
+print("body (first 800):", r.text[:800])
+
+
+
+
+
+
+
+
 import inspect
 from bedrock_agentcore.services.identity import IdentityClient
 
