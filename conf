@@ -1,26 +1,143 @@
-When creating an AgentCore runtime by uploading a ZIP artifact from S3, the only strict requirements are:
+AgentCore Identity – OAuth2 Credential Provider Validation (Auth0)
+Objective
 
+Validate that AgentCore Identity can securely obtain an OAuth2 access token from an external Identity Provider (Auth0) on behalf of a registered workload using a configured OAuth2 Credential Provider.
 
-The ZIP must contain a valid Python project.
+What Was Tested
 
+We tested the outbound OAuth2 token exchange flow from AgentCore Identity to Auth0 using the Client Credentials grant.
 
-The entryPoint must reference an importable module and callable function.
+This test focused specifically on validating:
 
+Workload identity authentication within AgentCore
 
-All dependencies must be declared in requirements.txt.
+OAuth2 Credential Provider configuration
 
+Token exchange via external IdP (Auth0)
 
-Beyond that, the internal code structure is flexible. You can vertically segment your agent by organizing tools into separate files or folders (for example, tools/echo.py, tools/math_add.py) and simply import and route them from your main entrypoint module. AgentCore does not require a single-file implementation — it only needs a resolvable entrypoint.
-In other words, when deploying via S3:
+Successful issuance of a scoped JWT access token
 
+This was an identity plumbing validation, not an API authorization test.
 
-The S3 artifact defines the runtime package.
+Step-by-Step Flow Validated
+1. Workload Identity Validation
 
+Confirmed the workload is registered in AgentCore Identity.
 
-The entrypoint defines where execution begins.
+Successfully called:
 
+get_workload_access_token(workload_name=...)
 
-Your internal modular structure (multiple tool files, folders, layered design) is fully supported as long as it is importable.
+Received a valid workloadAccessToken.
 
+Result:
+AgentCore recognizes and authenticates the workload.
 
-The key takeaway is that AgentCore runtime hosting is packaging-oriented, not file-structure–restricted — modular design is both supported and recommended.
+2. OAuth2 Credential Provider Configuration
+
+Created (or confirmed existing) OAuth2 Credential Provider in AgentCore Identity.
+
+Configured with:
+
+Auth0 discovery URL (/.well-known/openid-configuration)
+
+Client ID
+
+Client Secret
+
+Token endpoint
+
+Confirmed provider exists and is reusable.
+
+Result:
+AgentCore can securely store and use OAuth client credentials.
+
+3. Token Exchange (Core Validation)
+
+Used the workload access token to initiate OAuth token exchange via the credential provider.
+
+Requested:
+
+auth_flow = "M2M"
+
+scopes = ["read:test"]
+
+audience = https://agent-core-test-api
+
+Flow executed:
+
+Workload
+   ↓
+AgentCore Identity
+   ↓
+OAuth2 Credential Provider
+   ↓
+Auth0 /oauth/token (client_credentials)
+   ↓
+JWT Access Token Returned
+
+Result:
+AgentCore successfully obtained a JWT access token from Auth0.
+
+4. JWT Validation
+
+Decoded the returned token and verified:
+
+iss → Auth0 tenant URL
+
+aud → https://agent-core-test-api
+
+scope → read:test
+
+gty → client-credentials
+
+Valid expiration timestamps
+
+Result:
+Auth0 issued a properly scoped access token for the configured API.
+
+What This Test Proved
+
+AgentCore Identity can act as an OAuth2 token broker.
+
+Workloads can securely obtain scoped third-party access tokens.
+
+OAuth client credentials are centralized in the credential provider (not embedded in application code).
+
+External IdP integration (Auth0) works end-to-end.
+
+Client Credentials (Machine-to-Machine) flow is fully functional.
+
+What This Test Did NOT Cover
+
+This test did not validate:
+
+Backend API token enforcement
+
+API Gateway / Lambda authorizers
+
+IAM role assumption
+
+Inbound user authentication
+
+Resource-level authorization checks
+
+This was strictly an outbound OAuth token minting validation.
+
+Architectural Significance
+
+This enables the following enterprise use cases:
+
+Calling external APIs protected by Auth0
+
+Integrating AgentCore workloads with enterprise IdPs (Auth0 / Okta)
+
+Enforcing workload-level identity boundaries
+
+Centralized OAuth provider management
+
+Eliminating direct secret handling in runtime code
+
+One-Line Executive Summary
+
+Validated that AgentCore Identity can exchange a workload identity for a scoped Auth0 JWT access token using an OAuth2 credential provider via the client credentials flow.
