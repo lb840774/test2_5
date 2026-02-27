@@ -2,6 +2,18 @@ cid: LgzUtX228RiHzo4pOmgTtbye3eOcDcnD
 csec: 1PrXd8lLUHyqBL0EPMqm_1dFmTHJS5QhlZDIOVxmNxK5YhpBVl5-GdDBW8t71GW8
 
 
+from bedrock_agentcore.services.identity import IdentityClient
+
+identity = IdentityClient(region="us-east-1")
+
+print("IdentityClient methods that mention workload/provider/token:")
+for name in dir(identity):
+    low = name.lower()
+    if any(x in low for x in ["workload", "provider", "credential", "token", "oauth"]):
+        print(" -", name)
+
+
+
 
 import base64, json
 
