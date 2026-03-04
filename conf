@@ -1,143 +1,104 @@
-AgentCore Identity – OAuth2 Credential Provider Validation (Auth0)
+Amazon Bedrock AgentCore – Identity & Inbound Authentication Validation
 Objective
 
-Validate that AgentCore Identity can securely obtain an OAuth2 access token from an external Identity Provider (Auth0) on behalf of a registered workload using a configured OAuth2 Credential Provider.
+Validate that AgentCore Runtime supports secure inbound authentication using external Identity Providers (IdPs) via JWT bearer tokens, and confirm that unauthorized or tampered tokens are rejected before agent execution.
 
-What Was Tested
+The goal of this testing was to confirm that:
 
-We tested the outbound OAuth2 token exchange flow from AgentCore Identity to Auth0 using the Client Credentials grant.
+AgentCore can validate JWTs issued by an external IdP (Auth0).
 
-This test focused specifically on validating:
+Invalid or tampered tokens are rejected immediately.
 
-Workload identity authentication within AgentCore
+Valid tokens are accepted and forwarded to the runtime execution layer.
 
-OAuth2 Credential Provider configuration
+Architecture Under Test
 
-Token exchange via external IdP (Auth0)
+Authentication Flow
 
-Successful issuance of a scoped JWT access token
+Client / Application
+        │
+        │ 1. Request access token
+        ▼
+Auth0 Identity Provider
+        │
+        │ 2. JWT Access Token
+        ▼
+AgentCore Runtime Endpoint
+        │
+        │ 3. JWT Validation
+        │    • Signature verification
+        │    • Issuer validation
+        │    • Audience validation
+        │    • Client validation
+        ▼
+Agent Runtime Execution
+        │
+        ▼
+Agent Tools / Models
 
-This was an identity plumbing validation, not an API authorization test.
+Key configuration elements:
 
-Step-by-Step Flow Validated
-1. Workload Identity Validation
+Component	Configuration
+Identity Provider	Auth0
+Auth Type	JWT Bearer Token
+Discovery URL	.well-known/openid-configuration endpoint
+Token Source	OAuth2 Client Credentials Flow
+Runtime Protection	AgentCore Inbound Auth
+Test Environment
+Component	Details
+AWS Service	Amazon Bedrock AgentCore Runtime
+Region	us-east-1
+Identity Provider	Auth0
+Token Flow	OAuth Client Credentials
+Token Format	JWT
+Invocation Method	Agent Sandbox + Programmatic invocation
+Tests Performed
+Test 1 — Valid JWT Invocation
 
-Confirmed the workload is registered in AgentCore Identity.
+Steps
 
-Successfully called:
+Generated an access token from Auth0 via /oauth/token.
 
-get_workload_access_token(workload_name=...)
+Pasted the JWT into the AgentCore Sandbox invocation panel.
 
-Received a valid workloadAccessToken.
+Invoked the runtime endpoint.
 
-Result:
-AgentCore recognizes and authenticates the workload.
+Result
 
-2. OAuth2 Credential Provider Configuration
+Agent invocation failed (500)
 
-Created (or confirmed existing) OAuth2 Credential Provider in AgentCore Identity.
+Interpretation
 
-Configured with:
+Authentication succeeded.
 
-Auth0 discovery URL (/.well-known/openid-configuration)
+Request passed the JWT validation layer.
 
-Client ID
+Invocation reached the agent runtime execution stage.
 
-Client Secret
+Failure occurred downstream (likely model invocation / SCP restriction).
 
-Token endpoint
+This confirms JWT authentication is working and requests are allowed past the gateway when valid tokens are supplied.
 
-Confirmed provider exists and is reusable.
+Test 2 — Tampered JWT Signature
 
-Result:
-AgentCore can securely store and use OAuth client credentials.
+Steps
 
-3. Token Exchange (Core Validation)
+Modified a single character within the JWT token.
 
-Used the workload access token to initiate OAuth token exchange via the credential provider.
+Attempted invocation again.
 
-Requested:
+Result
 
-auth_flow = "M2M"
+Invalid Signature for bearerToken
 
-scopes = ["read:test"]
+Interpretation
 
-audience = https://agent-core-test-api
+AgentCore correctly rejected the request during JWT signature validation.
 
-Flow executed:
+This confirms:
 
-Workload
-   ↓
-AgentCore Identity
-   ↓
-OAuth2 Credential Provider
-   ↓
-Auth0 /oauth/token (client_credentials)
-   ↓
-JWT Access Token Returned
+Runtime retrieves IdP JWKS public keys
 
-Result:
-AgentCore successfully obtained a JWT access token from Auth0.
+JWT signature is cryptographically verified
 
-4. JWT Validation
-
-Decoded the returned token and verified:
-
-iss → Auth0 tenant URL
-
-aud → https://agent-core-test-api
-
-scope → read:test
-
-gty → client-credentials
-
-Valid expiration timestamps
-
-Result:
-Auth0 issued a properly scoped access token for the configured API.
-
-What This Test Proved
-
-AgentCore Identity can act as an OAuth2 token broker.
-
-Workloads can securely obtain scoped third-party access tokens.
-
-OAuth client credentials are centralized in the credential provider (not embedded in application code).
-
-External IdP integration (Auth0) works end-to-end.
-
-Client Credentials (Machine-to-Machine) flow is fully functional.
-
-What This Test Did NOT Cover
-
-This test did not validate:
-
-Backend API token enforcement
-
-API Gateway / Lambda authorizers
-
-IAM role assumption
-
-Inbound user authentication
-
-Resource-level authorization checks
-
-This was strictly an outbound OAuth token minting validation.
-
-Architectural Significance
-
-This enables the following enterprise use cases:
-
-Calling external APIs protected by Auth0
-
-Integrating AgentCore workloads with enterprise IdPs (Auth0 / Okta)
-
-Enforcing workload-level identity boundaries
-
-Centralized OAuth provider management
-
-Eliminating direct secret handling in runtime code
-
-One-Line Executive Summary
-
-Validated that AgentCore Identity can exchange a workload identity for a scoped Auth0 JWT access token using an OAuth2 credential provider via the client credentials flow.
+Tampered tokens are rejected immediately
