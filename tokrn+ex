@@ -1,35 +1,16 @@
-
-{
-  "openapi": "3.0.1",
-  "info": {
-    "title": "Auth0 Token Exchange Tool",
-    "version": "1.0"
-  },
-  "paths": {
-    "/token-exchange": {
-      "post": {
-        "operationId": "tokenExchange",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "properties": {
-                  "user_token": {
-                    "type": "string"
-                  }
-                }
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Token exchange response"
-          }
+[
+  {
+    "name": "tokenExchange",
+    "description": "Exchanges a user token for a scoped down token",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "user_token": {
+          "type": "string",
+          "description": "The original user bearer token"
         }
-      }
+      },
+      "required": ["user_token"]
     }
   }
-}
+]
