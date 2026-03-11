@@ -1,16 +1,37 @@
-[
-  {
-    "name": "tokenExchange",
-    "description": "Exchanges a user token for a scoped down token",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "user_token": {
-          "type": "string",
-          "description": "The original user bearer token"
+import requests
+from bedrock_agentcore import BedrockAgentCoreApp
+
+app = BedrockAgentCoreApp()
+
+GATEWAY_URL = "https://auth0-token-exchange-gateway-ap1jvhmstw.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
+
+@app.entrypoint
+def invoke(payload):
+    user_token = payload.get("user_token")
+
+    body = {
+        "jsonrpc": "2.0",
+        "id": "1",
+        "method": "tools/call",
+        "params": {
+            "name": "tokenExchange",
+            "arguments": {
+                "user_token": user_token
+            }
         }
-      },
-      "required": ["user_token"]
     }
-  }
-]
+
+    response = requests.post(
+        GATEWAY_URL,
+        json=body,
+        headers={"Content-Type": "application/json"},
+        timeout=30
+    )
+
+    return {
+        "status_code": response.status_code,
+        "gateway_response": response.json()
+    }
+
+if __name__ == "__main__":
+    app.run()
