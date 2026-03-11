@@ -8,23 +8,10 @@ def lambda_handler(event, context):
     if isinstance(event, dict):
         if "arguments" in event and isinstance(event["arguments"], dict):
             args = event["arguments"]
+        else:
+            args = event
 
-        elif "body" in event:
-            body = event["body"]
-
-            if isinstance(body, str):
-                try:
-                    body = json.loads(body)
-                except Exception:
-                    body = {}
-
-            if isinstance(body, dict):
-                if "arguments" in body and isinstance(body["arguments"], dict):
-                    args = body["arguments"]
-                else:
-                    args = body
-
-    print("ARGS:", json.dumps(args))
+    print("PARSED_ARGS:", json.dumps(args))
 
     a = args.get("a")
     b = args.get("b")
