@@ -1,37 +1,45 @@
-import requests
-from bedrock_agentcore import BedrockAgentCoreApp
+import json
 
-app = BedrockAgentCoreApp()
+def lambda_handler(event, context):
+    print("EVENT:", json.dumps(event))
 
-GATEWAY_URL = "https://auth0-token-exchange-gateway-ap1jvhmstw.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
+    args = event.get("arguments", {})
+    a = args.get("a")
+    b = args.get("b")
 
-@app.entrypoint
-def invoke(payload):
-    user_token = payload.get("user_token")
-
-    body = {
-        "jsonrpc": "2.0",
-        "id": "1",
-        "method": "tools/call",
-        "params": {
-            "name": "tokenExchange",
-            "arguments": {
-                "user_token": user_token
-            }
+    if a is None or b is None:
+        return {
+            "statusCode": 400,
+            "body": json.dumps({"error": "Missing a or b"})
         }
-    }
-
-    response = requests.post(
-        GATEWAY_URL,
-        json=body,
-        headers={"Content-Type": "application/json"},
-        timeout=30
-    )
 
     return {
-        "status_code": response.status_code,
-        "gateway_response": response.json()
+        "statusCode": 200,
+        "body": json.dumps({
+            "result": a + b
+        })
     }
 
-if __name__ == "__main__":
-    app.run()
+
+
+
+[
+  {
+    "name": "addNumbers",
+    "description": "Adds two numbers",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "a": {
+          "type": "number",
+          "description": "First number"
+        },
+        "b": {
+          "type": "number",
+          "description": "Second number"
+        }
+      },
+      "required": ["a", "b"]
+    }
+  }
+]
