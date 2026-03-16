@@ -1,3 +1,99 @@
+import requests, json
+
+AUTH0_DOMAIN = "YOUR_AUTH0_DOMAIN"   # no https://
+CLIENT_ID = "YOUR_CLIENT_ID"
+CLIENT_SECRET = "YOUR_CLIENT_SECRET"
+TARGET_AUDIENCE = "https://api.addition.example.com"
+TARGET_SCOPE = "calc:add"
+USER_TOKEN = token   # the token you already generated
+
+url = f"https://{AUTH0_DOMAIN}/oauth/token"
+
+payload = {
+    "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+    "client_id": CLIENT_ID,
+    "client_secret": CLIENT_SECRET,
+    "subject_token": USER_TOKEN,
+    "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+    "audience": TARGET_AUDIENCE,
+    "scope": TARGET_SCOPE,
+}
+
+resp = requests.post(url, data=payload, timeout=30)
+
+print("HTTP:", resp.status_code)
+print(resp.text)
+How to interpret the result
+If this returns 200
+
+Then Auth0 config is probably okay, and your interceptor Lambda likely has a network/VPC problem.
+
+Then check:
+
+is the interceptor Lambda attached to a VPC?
+
+if yes, does it have outbound internet access via NAT?
+
+can it resolve external DNS?
+
+If this returns 4xx
+
+Then the request reached Auth0, but Auth0 rejected it. That means we need to inspect:
+
+audience
+
+scope
+
+app permissions
+
+whether token exchange is enabled for that app/API
+
+If this also throws a connection error
+
+Then your domain/value is wrong or there’s a broader connectivity issue.
+
+Also check one easy thing right now
+
+Make sure:
+
+AUTH0_DOMAIN = dev-xxxxx.us.auth0.com
+
+and not:
+
+AUTH0_DOMAIN = https://dev-xxxxx.us.auth0.com
+
+Because your code already does:
+
+f"https://{AUTH0_DOMAIN}/oauth/token"
+
+If you included https:// in the env var, the URL becomes malformed.
+
+Tiny debug improvement for the interceptor
+
+Add these prints before the token call:
+
+print("TOKEN URL:", token_url)
+print("TARGET_AUDIENCE:", TARGET_AUDIENCE)
+print("TARGET_SCOPE:", TARGET_SCOPE)
+print("HAS_USER_TOKEN:", bool(user_token))
+print("USER_TOKEN_PREFIX:", user_token[:20] if user_token else None)
+
+Do not print the client secret.
+
+What I think is most likely
+
+Given your screenshot, my first suspicion is:
+
+the interceptor Lambda cannot successfully make the outbound HTTPS call to Auth0, or one of the URL/env values is malformed.
+
+So do the notebook token-exchange POST first. That will tell us immediately which side is broken.
+
+
+
+
+
+
+
 aTs4tlpbojscKsR3nHc4YjDjsN4Mggrd
 
 bEQ3R13ZBEcQdnGXy7zc2reZEjjJgqu0hisLvKvjZTbzEbhFYVCumAx05lz8uOm6
