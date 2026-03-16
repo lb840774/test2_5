@@ -4,3 +4,33 @@ bEQ3R13ZBEcQdnGXy7zc2reZEjjJgqu0hisLvKvjZTbzEbhFYVCumAx05lz8uOm6
 
 
 https://api.addition.example.com
+
+
+
+
+
+
+import requests
+
+AUTH0_DOMAIN = "YOUR_AUTH0_DOMAIN"   # example: dev-abc123.us.auth0.com
+CLIENT_ID = "YOUR_CLIENT_ID"
+CLIENT_SECRET = "YOUR_CLIENT_SECRET"
+AUDIENCE = "https://api.addition.example.com"
+
+url = f"https://{AUTH0_DOMAIN}/oauth/token"
+
+payload = {
+    "client_id": CLIENT_ID,
+    "client_secret": CLIENT_SECRET,
+    "audience": AUDIENCE,
+    "grant_type": "client_credentials"
+}
+
+resp = requests.post(url, json=payload)
+
+print(resp.json())
+
+token = resp.json()["access_token"]
+
+print("\nTOKEN:")
+print(token[:100])
