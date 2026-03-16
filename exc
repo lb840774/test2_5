@@ -1,0 +1,202 @@
+import json
+import os
+import base64
+import urllib.parse
+import urllib.request
+import urllib.error
+
+AUTH0_DOMAIN = os.environ["AUTH0_DOMAIN"]               # e.g. dev-xxxx.us.auth0.com
+AUTH0_CLIENT_ID = os.environ["AUTH0_CLIENT_ID"]
+AUTH0_CLIENT_SECRET = os.environ["AUTH0_CLIENT_SECRET"]
+TARGET_AUDIENCE = os.environ["TARGET_AUDIENCE"]         # e.g. https://api.addition.example.com
+TARGET_SCOPE = os.environ["TARGET_SCOPE"]               # e.g. calc:add
+
+def _decode_jwt_no_verify(token: str):
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return {"warning": "not a JWT"}
+        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = base64.urlsafe_b64decode(payload_b64.encode("utf-8"))
+        return json.loads(payload.decode("utf-8"))
+    except Exception as e:
+        return {"warning": f"unable to decode token: {str(e)}"}
+
+def _post_form(url: str, form: dict):
+    data = urllib.parse.urlencode(form).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        body = resp.read().decode("utf-8")
+        return resp.getcode(), json.loads(body)
+
+def lambda_handler(event, context):
+    print("INTERCEPTOR EVENT:", json.dumps(event))
+
+    # AgentCore request interceptor shape
+    gateway_request = event["mcp"]["gatewayRequest"]
+    body = gateway_request["body"]
+
+    if isinstance(body, str):
+        body = json.loads(body)
+
+    print("GATEWAY REQUEST BODY:", json.dumps(body))
+
+    # MCP tools/call request structure
+    # {
+    #   "jsonrpc": "2.0",
+    #   "id": "2",
+    #   "method": "tools/call",
+    #   "params": {
+    #       "name": "...",
+    #       "arguments": {
+    #           "a": 5,
+    #           "b": 3,
+    #           "user_token": "..."
+    #       }
+    #   }
+    # }
+    arguments = body.get("params", {}).get("arguments", {})
+    user_token = arguments.get("user_token")
+
+    # If no user_token, just pass through unchanged
+    if not user_token:
+        print("No user_token provided; passing through unchanged")
+        return {
+            "interceptorOutputVersion": "1.0",
+            "mcp": {
+                "transformedGatewayRequest": {
+                    "body": body
+                }
+            }
+        }
+
+    token_url = f"https://{AUTH0_DOMAIN}/oauth/token"
+
+    form = {
+        "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+        "client_id": AUTH0_CLIENT_ID,
+        "client_secret": AUTH0_CLIENT_SECRET,
+        "subject_token": user_token,
+        "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+        "audience": TARGET_AUDIENCE,
+        "scope": TARGET_SCOPE,
+    }
+
+    try:
+        status_code, exchange_resp = _post_form(token_url, form)
+        print("AUTH0 TOKEN EXCHANGE STATUS:", status_code)
+        print("AUTH0 TOKEN EXCHANGE RESPONSE:", json.dumps(exchange_resp))
+
+        exchanged_token = exchange_resp.get("access_token")
+        exchanged_claims = _decode_jwt_no_verify(exchanged_token) if exchanged_token else {}
+        print("EXCHANGED TOKEN CLAIMS:", json.dumps(exchanged_claims))
+
+        # Keep request flowing unchanged for now so addNumbers still returns 8
+        return {
+            "interceptorOutputVersion": "1.0",
+            "mcp": {
+                "transformedGatewayRequest": {
+                    "body": body
+                }
+            }
+        }
+
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8") if e.fp else str(e)
+        print("AUTH0 HTTP ERROR:", err_body)
+        raise Exception(f"Token exchange failed: HTTP {e.code} {err_body}")
+
+    except Exception as e:
+        print("GENERAL ERROR:", str(e))
+        raise
+
+Auth0’s custom token exchange uses /oauth/token and accepts a subject_token, subject_token_type, requested audience, and scope.
+
+2) Set these Lambda environment variables
+
+In the same interceptor Lambda, set:
+
+AUTH0_DOMAIN = your Auth0 domain, like dev-3nbp7mornmibsyo0.us.auth0.com
+
+AUTH0_CLIENT_ID = your Auth0 M2M app client ID
+
+AUTH0_CLIENT_SECRET = the matching client secret
+
+TARGET_AUDIENCE = https://api.addition.example.com
+
+TARGET_SCOPE = calc:add
+
+Then click Deploy again.
+
+3) Run this in your Jupyter notebook
+
+This is the part you were asking about: yes, now you must include user_token in the MCP arguments, because otherwise there is nothing for the interceptor to exchange.
+
+import requests
+import json
+
+GATEWAY_URL = "PASTE_YOUR_GATEWAY_MCP_URL_HERE"
+USER_TOKEN = "PASTE_REAL_AUTH0_USER_ACCESS_TOKEN_HERE"
+
+def mcp(method, params=None, _id=1):
+    resp = requests.post(
+        GATEWAY_URL,
+        json={
+            "jsonrpc": "2.0",
+            "id": str(_id),
+            "method": method,
+            "params": params or {}
+        },
+        headers={"Content-Type": "application/json"},
+        timeout=30
+    )
+    print("HTTP:", resp.status_code)
+    print(json.dumps(resp.json(), indent=2))
+    return resp.json()
+
+# Optional: confirm tool name
+mcp("tools/list", {}, _id=1)
+
+# Actual call: add numbers + provide user token for exchange
+call_resp = mcp(
+    "tools/call",
+    {
+        "name": "target-quick-start-5bded3__addNumbers",  # replace if your tool name changed
+        "arguments": {
+            "a": 5,
+            "b": 3,
+            "user_token": USER_TOKEN
+        }
+    },
+    _id=2
+)
+4) What you should expect
+
+In the notebook, the Addition Tool should still succeed and return 8.
+
+In the interceptor Lambda CloudWatch logs, you want to see:
+
+AUTH0 TOKEN EXCHANGE STATUS: 200
+
+AUTH0 TOKEN EXCHANGE RESPONSE: ...
+
+EXCHANGED TOKEN CLAIMS: ...
+
+And in those decoded claims, you want:
+
+aud = https://api.addition.example.com
+
+scope includes calc:add
+
+That is the proof the returned token is downscoped.
+
+5) Where AgentCore Identity fits after this
+
+Once this works, the next refinement is to stop using Lambda env vars for the Auth0 client credentials and move that reusable OAuth client configuration to AgentCore Identity. That’s the cleaner supported place for outbound OAuth client config; the current step is just the fastest way to prove the exchange itself.
+
+If you paste the next CloudWatch interceptor log output, I can tell you immediately whether the exchange succeeded or exactly what Auth0 is rejecting.
