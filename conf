@@ -1,144 +1,109 @@
-End-to-End Token Exchange Validation with AgentCore Gateway and Auth0
-
-Objective
-We wanted to test whether Amazon Bedrock AgentCore Gateway can integrate with an external identity provider (Auth0) to perform OAuth token exchange and issue a scoped-down token that is used to securely call a downstream tool/API.
-
-The goal was to confirm that:
-- An incoming token can be intercepted
-- That token can be exchanged through Auth0
-- A new token with reduced permissions can be issued
-- The downstream tool can execute successfully using the scoped token
-
-Architecture Tested
-
-Notebook Client
-      |
-      | (user token)
-      v
-AgentCore Gateway
-      |
-      v
-Request Interceptor Lambda
-      |
-      | OAuth Token Exchange
-      v
-Auth0
-      |
-      | Scoped Access Token
-      v
-Addition Tool API
-
-
-Step-by-Step Flow
-
-1. Client Calls AgentCore
-The client (Jupyter notebook) invoked a tool through the AgentCore Gateway using:
-
-mcp("tools/call", ...)
-
-The request included a token passed as:
-"user_token"
-
-This token represents the identity of the caller.
-
-
-2. AgentCore Gateway Receives the Request
-The AgentCore Gateway processes the request and triggers a Request Interceptor Lambda before the tool is executed.
-
-The interceptor acts as a security control point where authentication or token transformation can occur.
-
-
-3. Interceptor Performs Token Exchange
-Inside the interceptor Lambda, the code calls the Auth0 OAuth endpoint:
-
-POST https://{AUTH0_DOMAIN}/oauth/token
-
-using the OAuth Token Exchange grant type:
-
-grant_type = urn:ietf:params:oauth:grant-type:token-exchange
-
-The interceptor sends the following parameters:
-
-subject_token       = original incoming token
-subject_token_type  = urn:fastmcp:mcp
-audience            = https://api.addition.example.com
-scope               = calc:add
-client_id           = AgentCore Test Application client
-client_secret       = matching client secret
-
-This tells Auth0:
-
-"Exchange this incoming token for a new token that only has permission to call the Addition API."
-
-
-4. Auth0 Issues a Scoped Token
-Auth0 validates the request and returns a new access token.
-
-This new token contains reduced permissions and a different target audience.
-
-The token is now scoped specifically for the downstream API.
-
-
-5. Gateway Continues Tool Execution
-After the token exchange completes successfully, the gateway continues processing the request.
-
-The downstream tool executes:
-
-addNumbers(5,3)
-
-and returns the expected result.
-
-
-Verification of Downscoping
-
-We decoded both the original token and the exchanged token to confirm the exchange worked correctly.
-
-Original Token Claims
-aud: https://agent-core-test-api
-scope: read:test invoke:runtime
-
-This token was intended for AgentCore runtime access.
-
-Exchanged Token Claims
-aud: https://api.addition.example.com
-scope: calc:add
-
-This confirms the exchanged token was:
-
-1. Targeted to the downstream Addition API
-2. Reduced to only the calc:add permission
-
-This verifies that the token was successfully downscoped.
-
-
-What Was Successfully Demonstrated
-
-1. AgentCore Gateway can forward identity tokens to an interceptor.
-
-2. The interceptor Lambda can perform OAuth token exchange with Auth0.
-
-3. Auth0 can issue a new token with restricted audience and scope.
-
-4. The downstream tool can execute successfully using the exchanged token.
-
-
-Security Benefit
-
-This pattern implements least-privilege access.
-
-Instead of giving downstream tools a full user token, the system exchanges the token and creates a limited token specifically for the target API.
-
-User Token
-     |
-Token Exchange
-     |
-Scoped Tool Token
-
-
-Conclusion
-
-We successfully validated an end-to-end OAuth token exchange flow between Amazon Bedrock AgentCore Gateway and Auth0.
-
-The interceptor Lambda exchanged the incoming token through Auth0 and received a scoped-down token targeting the Addition Tool API. The gateway then completed the tool invocation using that token, and the tool executed successfully.
-
-By decoding both tokens, we confirmed that the exchanged token had a different audience and a reduced scope, proving that token downscoping and secure downstream API access works correctly in this architecture.
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 1) USER / CLIENT APP                                                       │
+│    - Browser / mobile app / Postman / another service                      │
+└──────────────────────────────┬──────────────────────────────────────────────┘
+                               │
+                               │ (A) User signs in
+                               ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 2) EXTERNAL IDP                                                            │
+│    - Auth0 / Okta / Entra / Cognito                                        │
+│    - Issues EXTERNAL OAuth/JWT token                                       │
+└──────────────────────────────┬──────────────────────────────────────────────┘
+                               │
+                               │ (B) User calls Runtime with bearer token
+                               ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 3) AGENTCORE RUNTIME                                                       │
+│                                                                             │
+│   3a. RUNTIME INBOUND AUTH                                                  │
+│       [AGENTCORE IDENTITY EXERCISED]                                        │
+│       - Validates inbound JWT                                               │
+│       - Confirms caller can access Runtime                                  │
+│                                                                             │
+│   3b. TOKEN EXCHANGE / INTERNAL TRUST SETUP                                 │
+│       [AGENTCORE IDENTITY EXERCISED]                                        │
+│       - Extracts USER identity from JWT                                     │
+│       - Looks up RUNTIME WORKLOAD identity                                  │
+│       - BINDS them together:                                                │
+│           "This Runtime workload is acting on behalf of this user"          │
+│       - Obtains WORKLOAD ACCESS TOKEN                                       │
+│                                                                             │
+│       Binding result conceptually:                                          │
+│       {                                                                     │
+│         user: "Lakshmi",                                                    │
+│         workload: "Runtime-Agent-123",                                      │
+│         permissions: [allowed tools/providers]                              │
+│       }                                                                     │
+│                                                                             │
+│       IMPORTANT:                                                            │
+│       - Workload Access Token is NOT the backend API token                  │
+│       - It is for first-party AgentCore services only                       │
+│       - Runtime automatically receives it during execution                  │
+│                                                                             │
+│   3c. AGENT EXECUTION                                                       │
+│       - Runs agent logic / orchestration                                    │
+│       - Decides a tool is needed                                            │
+└──────────────────────────────┬──────────────────────────────────────────────┘
+                               │
+                               │ (C) Runtime code calls Gateway MCP endpoint
+                               │
+                               │ IMPORTANT:
+                               │ - Your code chooses WHERE to call
+                               │ - This call IMPLICITLY carries forward the
+                               │   already-bound AgentCore context from 3b
+                               │ - The MCP URL is the destination only;
+                               │   AgentCore handles context propagation
+                               ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 4) AGENTCORE GATEWAY                                                       │
+│                                                                             │
+│   4a. GATEWAY INBOUND AUTH                                                  │
+│       [AGENTCORE IDENTITY EXERCISED]                                        │
+│       - Validates whoever is calling the Gateway                            │
+│       - Protects Gateway as its own entry point                             │
+│                                                                             │
+│   4b. TOOL FACADE / MCP ENDPOINT                                            │
+│       - Exposes tools through MCP                                           │
+│       - Supports tools/list and tools/call                                  │
+│                                                                             │
+│   4c. GATEWAY OUTBOUND AUTH REQUEST                                         │
+│       [AGENTCORE IDENTITY EXERCISED]                                        │
+│       - Gateway uses the propagated internal AgentCore context              │
+│       - Workload access token is applied automatically behind the scenes     │
+│       - Identity uses that token/context to understand:                     │
+│           • which workload is asking                                        │
+│           • which user it is acting for                                     │
+│           • what permissions apply                                          │
+│                                                                             │
+│       Example decision:                                                     │
+│       "Can Runtime-Agent-123, acting for Lakshmi, use LoanAPI provider?"    │
+│                                                                             │
+│       - If allowed, Identity authorizes access to credentials               │
+└──────────────────────────────┬──────────────────────────────────────────────┘
+                               │
+                               │ (D) If OAuth is needed, Identity uses the
+                               │     configured credential provider / token
+                               │     endpoint flow to get the REAL backend
+                               │     API token
+                               ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 5) DOWNSTREAM AUTH SERVER / TOKEN ENDPOINT                                 │
+│    - Returns ACTUAL OAuth access token for backend API                      │
+│    - Different from the Workload Access Token                               │
+└──────────────────────────────┬──────────────────────────────────────────────┘
+                               │
+                               │ (E) Real API token returned to Gateway
+                               ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 6) BACKEND TARGET                                                          │
+│    - API / Lambda / SaaS / AWS service / MCP server                         │
+│    - Gateway calls target using the REAL outbound credentials               │
+└──────────────────────────────┬──────────────────────────────────────────────┘
+                               │
+                               │ (F) Response
+                               ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 7) RESPONSE PATH                                                           │
+│    Backend Target → Gateway → Runtime → User                                │
+└─────────────────────────────────────────────────────────────────────────────┘
