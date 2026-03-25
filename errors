@@ -1,3 +1,5 @@
+
+
 import json
 import base64
 
@@ -18,16 +20,26 @@ def decode_jwt_no_verify(token: str):
 
 def lambda_handler(event, context):
     print("RAW EVENT:", json.dumps(event))
+    print("EVENT KEYS:", list(event.keys()) if isinstance(event, dict) else "not a dict")
+
+    if isinstance(event, dict) and "params" in event:
+        print("EVENT PARAMS:", json.dumps(event.get("params", {})))
+
+    if isinstance(event, dict) and "arguments" in event:
+        print("EVENT ARGUMENTS:", json.dumps(event.get("arguments", {})))
 
     args = {}
 
     if isinstance(event, dict):
         if "arguments" in event and isinstance(event["arguments"], dict):
             args = event["arguments"]
+        elif "params" in event and isinstance(event["params"], dict):
+            args = event["params"].get("arguments", {})
         else:
             args = event
 
     print("PARSED_ARGS:", json.dumps(args))
+    print("ARGS KEYS:", list(args.keys()) if isinstance(args, dict) else "not a dict")
 
     a = args.get("a")
     b = args.get("b")
