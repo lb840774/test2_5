@@ -1,0 +1,56 @@
+import os
+import json
+import requests
+from bedrock_agentcore.runtime import BedrockAgentCoreApp
+
+app = BedrockAgentCoreApp()
+
+GATEWAY_URL = os.environ["GATEWAY_URL"]
+TOOL_NAME = os.environ["TOOL_NAME"]
+
+def call_gateway(a, b, user_token=None):
+    payload = {
+        "jsonrpc": "2.0",
+        "id": "1",
+        "method": "tools/call",
+        "params": {
+            "name": TOOL_NAME,
+            "arguments": {
+                "a": a,
+                "b": b
+            }
+        }
+    }
+
+    if user_token:
+        payload["params"]["arguments"]["user_token"] = user_token
+
+    resp = requests.post(
+        GATEWAY_URL,
+        json=payload,
+        headers={"Content-Type": "application/json"},
+        timeout=30
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+@app.entrypoint
+def runtime_forwarder(payload):
+    a = payload.get("a")
+    b = payload.get("b")
+    user_token = payload.get("user_token")
+
+    print("Runtime received payload:", json.dumps(payload))
+    print("Calling gateway:", GATEWAY_URL)
+    print("Tool name:", TOOL_NAME)
+    print("Has user token:", bool(user_token))
+
+    gateway_resp = call_gateway(a, b, user_token)
+
+    return {
+        "runtime_received": True,
+        "gateway_response": gateway_resp
+    }
+
+if __name__ == "__main__":
+    app.run()
