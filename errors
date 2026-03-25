@@ -1,22 +1,93 @@
-collection_name = "lr-serial-pipeline-collection"
+import json
+import base64
 
-# Create collection if needed
-try:
-    sm.create_model_package_group_collection(
-        ModelPackageGroupCollectionName=collection_name,
-        ModelPackageGroupCollectionDescription="Serial inference pipeline collection"
-    )
-    print("Collection created")
-except sm.exceptions.ResourceInUse:
-    print("Collection already exists")
+EXPECTED_AUD = "https://api.addition.example.com"
+EXPECTED_SCOPE = "calc:add"
 
-# Add groups to collection
-for group_name in [g1, g2, g3]:
+def decode_jwt_no_verify(token: str):
     try:
-        sm.create_model_package_group_collection_membership(
-            ModelPackageGroupCollectionName=collection_name,
-            ModelPackageGroupName=group_name
-        )
-        print(f"Added {group_name} to collection")
-    except sm.exceptions.ResourceInUse:
-        print(f"{group_name} already in collection")
+        parts = token.split(".")
+        if len(parts) != 3:
+            return {"warning": "not a JWT"}
+
+        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = base64.urlsafe_b64decode(payload_b64.encode("utf-8"))
+        return json.loads(payload.decode("utf-8"))
+    except Exception as e:
+        return {"warning": f"unable to decode token: {str(e)}"}
+
+def lambda_handler(event, context):
+    print("RAW EVENT:", json.dumps(event))
+
+    args = {}
+
+    if isinstance(event, dict):
+        if "arguments" in event and isinstance(event["arguments"], dict):
+            args = event["arguments"]
+        else:
+            args = event
+
+    print("PARSED_ARGS:", json.dumps(args))
+
+    a = args.get("a")
+    b = args.get("b")
+    exchanged_token = args.get("exchanged_token")
+
+    if a is None or b is None:
+        return {
+            "statusCode": 400,
+            "body": json.dumps({
+                "error": "Missing a or b",
+                "received_event": event,
+                "parsed_args": args
+            })
+        }
+
+    if not exchanged_token:
+        return {
+            "statusCode": 401,
+            "body": json.dumps({
+                "error": "Missing exchanged_token",
+                "received_event": event,
+                "parsed_args": args
+            })
+        }
+
+    claims = decode_jwt_no_verify(exchanged_token)
+    print("EXCHANGED TOKEN CLAIMS AT BACKEND:", json.dumps(claims))
+
+    aud = claims.get("aud")
+    scope = claims.get("scope", "")
+
+    aud_ok = aud == EXPECTED_AUD or (isinstance(aud, list) and EXPECTED_AUD in aud)
+    scope_ok = EXPECTED_SCOPE in scope.split()
+
+    if not aud_ok:
+        return {
+            "statusCode": 403,
+            "body": json.dumps({
+                "error": "Invalid audience",
+                "received_aud": aud,
+                "received_scope": scope
+            })
+        }
+
+    if not scope_ok:
+        return {
+            "statusCode": 403,
+            "body": json.dumps({
+                "error": "Missing required scope",
+                "received_aud": aud,
+                "received_scope": scope
+            })
+        }
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps({
+            "result": a + b,
+            "validated_backend_token": True,
+            "received_aud": aud,
+            "received_scope": scope
+        })
+    }
