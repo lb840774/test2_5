@@ -1,601 +1,93 @@
-Yep — let’s turn it into a do this first, then this, then this tutorial.
-
-I’m going to assume:
-
-- Research account already trained the original model and Control Plane already has the model package group
-- Production account already has access to the retraining data
-- you want the new retrained version to be registered in the same Control Plane model package group
-- the new version’s ModelDataUrl should point to Production S3
-- IAM is already handled
-
-Also, the key service behavior we’re relying on is:
-- SageMaker emits training job state change events to EventBridge in near real time
-- new registry entries are created with CreateModelPackage, which creates a version inside a model group
-- model approval states can be set to Approved, Rejected, or PendingManualApproval and updated later
-
----
-
-WHAT YOU ARE BUILDING
-
-You are building this chain:
-
-1. You manually send a StartRetrain event in Production
-2. EventBridge in Production triggers Lambda #1
-3. Lambda #1 starts a SageMaker training job
-4. SageMaker finishes training and automatically emits a Completed event to EventBridge
-5. EventBridge triggers Lambda #2
-6. Lambda #2:
-   - reads the training output S3 URI from the completed training job
-   - assumes a role in Control Plane
-   - creates a new model version in the existing model package group in Control Plane
-   - points that new version to the Production S3 artifact
-   - optionally marks old approved versions as Rejected so only the newest approved one remains active
-
----
-
-WHAT TO CREATE, IN ORDER
-
-Do this in this exact order:
-
-1. Create the two Lambda functions in Production
-2. Add environment variable to Lambda #2
-3. Create the two EventBridge rules in Production
-4. Add the EventBridge targets
-5. Add Lambda invoke permissions
-6. Send a test event
-7. Watch Lambda #1 start training
-8. Wait for training completion
-9. Watch Lambda #2 register the new model version in Control Plane
-
----
-
-FOLDER STRUCTURE ON YOUR LAPTOP
-
-Create a folder anywhere on your machine called:
-
-retrain-poc
-
-Inside it, create:
-
-retrain-poc/
-  start_retraining_lambda.py
-  register_model_version_lambda.py
-
-You are going to paste one file into each.
-
----
-
-STEP 1: CREATE LAMBDA #1 CODE
-
-Create a file named:
-
-start_retraining_lambda.py
-
-Paste this exactly:
-
-~~~python
-import json
-import boto3
-
-sm = boto3.client("sagemaker")
-
-def lambda_handler(event, context):
-    detail = event["detail"]
-
-    model_package_group_name = detail["model_package_group_name"]
-    training_job_name = detail["training_job_name"]
-    training_image = detail["training_image"]
-    role_arn = detail["role_arn"]
-    input_s3_uri = detail["input_s3_uri"]
-    output_s3_uri = detail["output_s3_uri"]
-    instance_type = detail.get("instance_type", "ml.m5.xlarge")
-
-    inference_image = detail["inference_image"]
-    approval_status = detail.get("approval_status", "Approved")
-    base_model_package_arn = detail.get("base_model_package_arn", "")
-    changed_feature_reason = detail.get("changed_feature_reason", "")
-
-    response = sm.create_training_job(
-        TrainingJobName=training_job_name,
-        AlgorithmSpecification={
-            "TrainingImage": training_image,
-            "TrainingInputMode": "File"
-        },
-        RoleArn=role_arn,
-        InputDataConfig=[
-            {
-                "ChannelName": "train",
-                "DataSource": {
-                    "S3DataSource": {
-                        "S3DataType": "S3Prefix",
-                        "S3Uri": input_s3_uri,
-                        "S3DataDistributionType": "FullyReplicated"
-                    }
-                },
-                "InputMode": "File"
-            }
-        ],
-        OutputDataConfig={
-            "S3OutputPath": output_s3_uri
-        },
-        ResourceConfig={
-            "InstanceType": instance_type,
-            "InstanceCount": 1,
-            "VolumeSizeInGB": 30
-        },
-        StoppingCondition={
-            "MaxRuntimeInSeconds": 3600
-        },
-        HyperParameters={
-            "epochs": "5"
-        },
-        Tags=[
-            {"Key": "model_package_group_name", "Value": model_package_group_name},
-            {"Key": "inference_image", "Value": inference_image},
-            {"Key": "approval_status", "Value": approval_status},
-            {"Key": "base_model_package_arn", "Value": base_model_package_arn},
-            {"Key": "changed_feature_reason", "Value": changed_feature_reason}
-        ]
-    )
-
-    return {
-        "statusCode": 200,
-        "trainingJobArn": response["TrainingJobArn"],
-        "trainingJobName": training_job_name
-    }
-~~~
-
-This Lambda is the one that starts the SageMaker training job using create_training_job, which is the correct API for kicking off training in SageMaker. Training artifacts are written to the OutputDataConfig S3 path you pass in.
-
----
-
-STEP 2: CREATE LAMBDA #2 CODE
-
-Create a file named:
-
-register_model_version_lambda.py
-
-Paste this exactly:
-
-~~~python
 import os
-import boto3
-
-REGION = os.environ.get("AWS_REGION", "us-east-1")
-CONTROL_PLANE_ROLE_ARN = os.environ["CONTROL_PLANE_ROLE_ARN"]
-
-sts = boto3.client("sts")
-sm_prod = boto3.client("sagemaker", region_name=REGION)
-
-def assume_cp_sagemaker_client():
-    resp = sts.assume_role(
-        RoleArn=CONTROL_PLANE_ROLE_ARN,
-        RoleSessionName="register-model-version-session"
-    )
-    creds = resp["Credentials"]
-
-    return boto3.client(
-        "sagemaker",
-        region_name=REGION,
-        aws_access_key_id=creds["AccessKeyId"],
-        aws_secret_access_key=creds["SecretAccessKey"],
-        aws_session_token=creds["SessionToken"],
-    )
-
-def list_training_job_tags(training_job_arn):
-    resp = sm_prod.list_tags(ResourceArn=training_job_arn)
-    return {t["Key"]: t["Value"] for t in resp.get("Tags", [])}
-
-def reject_older_versions(sm_cp, model_package_group_name, keep_model_package_arn):
-    paginator = sm_cp.get_paginator("list_model_packages")
-    pages = paginator.paginate(
-        ModelPackageGroupName=model_package_group_name,
-        SortBy="CreationTime",
-        SortOrder="Descending"
-    )
-
-    for page in pages:
-        for pkg in page.get("ModelPackageSummaryList", []):
-            arn = pkg["ModelPackageArn"]
-            if arn == keep_model_package_arn:
-                continue
-
-            if pkg.get("ModelApprovalStatus") == "Approved":
-                sm_cp.update_model_package(
-                    ModelPackageArn=arn,
-                    ModelApprovalStatus="Rejected"
-                )
-
-def lambda_handler(event, context):
-    detail = event["detail"]
-    training_job_name = detail["TrainingJobName"]
-
-    desc = sm_prod.describe_training_job(TrainingJobName=training_job_name)
-    training_job_arn = desc["TrainingJobArn"]
-    model_artifact_uri = desc["ModelArtifacts"]["S3ModelArtifacts"]
-
-    tags = list_training_job_tags(training_job_arn)
-
-    model_package_group_name = tags["model_package_group_name"]
-    inference_image = tags["inference_image"]
-    approval_status = tags.get("approval_status", "Approved")
-    base_model_package_arn = tags.get("base_model_package_arn", "")
-    changed_feature_reason = tags.get("changed_feature_reason", "")
-
-    sm_cp = assume_cp_sagemaker_client()
-
-    create_resp = sm_cp.create_model_package(
-        ModelPackageGroupName=model_package_group_name,
-        ModelApprovalStatus=approval_status,
-        ModelPackageDescription=(
-            f"Retrained in production from SageMaker training job {training_job_name}. "
-            f"Artifact remains in Production S3."
-        ),
-        InferenceSpecification={
-            "Containers": [
-                {
-                    "Image": inference_image,
-                    "ModelDataUrl": model_artifact_uri
-                }
-            ],
-            "SupportedContentTypes": ["application/json"],
-            "SupportedResponseMIMETypes": ["application/json"],
-            "SupportedRealtimeInferenceInstanceTypes": [
-                "ml.m5.large",
-                "ml.m5.xlarge"
-            ],
-            "SupportedTransformInstanceTypes": [
-                "ml.m5.large",
-                "ml.m5.xlarge"
-            ]
-        },
-        CustomerMetadataProperties={
-            "source_account_type": "production",
-            "production_training_job_name": training_job_name,
-            "production_model_artifact_uri": model_artifact_uri,
-            "base_model_package_arn": base_model_package_arn,
-            "changed_feature_reason": changed_feature_reason
-        }
-    )
-
-    new_model_package_arn = create_resp["ModelPackageArn"]
+import shutil
+import zipfile
+import subprocess
 
-    if approval_status == "Approved":
-        reject_older_versions(
-            sm_cp=sm_cp,
-            model_package_group_name=model_package_group_name,
-            keep_model_package_arn=new_model_package_arn
-        )
+# clean
+shutil.rmtree("deployment_package", ignore_errors=True)
+os.makedirs("deployment_package", exist_ok=True)
 
-    return {
-        "statusCode": 200,
-        "trainingJobName": training_job_name,
-        "newModelPackageArn": new_model_package_arn,
-        "productionArtifactUri": model_artifact_uri
-    }
-~~~
+# install dependencies into package folder
+subprocess.run(
+    ["python", "-m", "pip", "install", "--target", "deployment_package", "requests", "bedrock-agentcore"],
+    check=True
+)
 
-This Lambda uses describe_training_job to find the finished training artifact, then calls CreateModelPackage in the Control Plane account to create a new version in the model package group. The ModelDataUrl is set to the Production S3 artifact path, which is valid as long as later consumers can read that object and it is in the same Region.
+# copy main.py into package root
+shutil.copy("runtime_forwarder/main.py", "deployment_package/main.py")
 
----
+# zip everything
+zip_name = "runtime_forwarder.zip"
+with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED) as z:
+    for root, dirs, files in os.walk("deployment_package"):
+        for f in files:
+            full = os.path.join(root, f)
+            arc = os.path.relpath(full, "deployment_package")
+            z.write(full, arc)
 
-STEP 3: ZIP THE LAMBDA CODE
+print("Created", zip_name)
 
-From inside the retrain-poc folder, run:
 
-~~~bash
-zip start_retraining_lambda.zip start_retraining_lambda.py
-zip register_model_version_lambda.zip register_model_version_lambda.py
-~~~
 
----
 
-STEP 4: CREATE LAMBDA #1 IN THE PRODUCTION ACCOUNT
 
-Open the AWS Console in the Production account.
 
-Go to:
+import os
+import shutil
+import zipfile
+import subprocess
 
-Lambda → Create function
+# clean
+shutil.rmtree("deployment_package", ignore_errors=True)
+os.makedirs("deployment_package", exist_ok=True)
 
-Choose:
-- Author from scratch
-- Function name: start-retraining-lambda
-- Runtime: Python 3.12 or Python 3.11
-- Execution role: choose your existing Lambda role
+# install dependencies into package folder
+subprocess.run(
+    ["python", "-m", "pip", "install", "--target", "deployment_package", "requests", "bedrock-agentcore"],
+    check=True
+)
 
-After the function is created:
-- go to Code
-- choose Upload from → .zip file
-- upload start_retraining_lambda.zip
-- click Deploy
+# copy main.py into package root
+shutil.copy("runtime_forwarder/main.py", "deployment_package/main.py")
 
----
+# zip everything
+zip_name = "runtime_forwarder.zip"
+with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED) as z:
+    for root, dirs, files in os.walk("deployment_package"):
+        for f in files:
+            full = os.path.join(root, f)
+          import os
+import shutil
+import zipfile
+import subprocess
 
-STEP 5: CREATE LAMBDA #2 IN THE PRODUCTION ACCOUNT
+# clean
+shutil.rmtree("deployment_package", ignore_errors=True)
+os.makedirs("deployment_package", exist_ok=True)
 
-Still in the Production account:
+# install dependencies into package folder
+subprocess.run(
+    ["python", "-m", "pip", "install", "--target", "deployment_package", "requests", "bedrock-agentcore"],
+    check=True
+)
 
-Go to:
+# copy main.py into package root
+shutil.copy("runtime_forwarder/main.py", "deployment_package/main.py")
 
-Lambda → Create function
+# zip everything
+zip_name = "runtime_forwarder.zip"
+with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED) as z:
+    for root, dirs, files in os.walk("deployment_package"):
+        for f in files:
+            full = os.path.join(root, f)
+            arc = os.path.relpath(full, "deployment_package")
+            z.write(full, arc)
 
-Choose:
-- Function name: register-model-version-lambda
-- Runtime: Python 3.12 or Python 3.11
-- Execution role: choose your existing Lambda role
+print("Created", zip_name)  arc = os.path.relpath(full, "deployment_package")
+            z.write(full, arc)
 
-Then:
-- upload register_model_version_lambda.zip
-- click Deploy
+print("Created", zip_name)
 
-Now go to:
 
-Configuration → Environment variables
 
-Add this variable:
 
-- Key: CONTROL_PLANE_ROLE_ARN
-- Value: your Control Plane cross-account role ARN
-
-Example:
-
-arn:aws:iam::111111111111:role/CrossAccountModelRegistryRegistrationRole
-
-That role is what Lambda #2 will assume before creating the new model version in Control Plane.
-
----
-
-STEP 6: CREATE EVENTBRIDGE RULE #1 IN PRODUCTION
-
-Go to:
-
-Amazon EventBridge → Rules → Create rule
-
-Set:
-
-- Name: start-retrain-rule
-- Event bus: default
-- Rule type: Rule with an event pattern
-
-For the event pattern, choose Custom pattern and paste:
-
-~~~json
-{
-  "source": ["custom.mlops.retrain"],
-  "detail-type": ["StartRetrain"]
-}
-~~~
-
-For the target:
-- choose Lambda function
-- select start-retraining-lambda
-
-Finish and create the rule.
-
-This rule waits for your custom event and then starts the training job.
-
----
-
-STEP 7: CREATE EVENTBRIDGE RULE #2 IN PRODUCTION
-
-Go to:
-
-Amazon EventBridge → Rules → Create rule
-
-Set:
-
-- Name: register-model-on-training-complete
-- Event bus: default
-- Rule type: Rule with an event pattern
-
-Paste this event pattern:
-
-~~~json
-{
-  "source": ["aws.sagemaker"],
-  "detail-type": ["SageMaker Training Job State Change"],
-  "detail": {
-    "TrainingJobStatus": ["Completed"]
-  }
-}
-~~~
-
-For the target:
-- choose Lambda function
-- select register-model-version-lambda
-
-Create the rule.
-
-SageMaker sends SageMaker Training Job State Change events directly to EventBridge, so this rule is what wires training completion to registry update.
-
----
-
-STEP 8: MAKE SURE EVENTBRIDGE CAN INVOKE THE LAMBDAS
-
-Usually the console adds this automatically when you attach the Lambda as a target. If you use the console, you probably do not need to do anything else.
-
-If you want to verify, open each Lambda and check:
-
-Configuration → Permissions
-
-You should see a resource-based policy allowing events.amazonaws.com to invoke it.
-
----
-
-STEP 9: SEND THE EVENT THAT STARTS RETRAINING
-
-Now you manually send the initial event into EventBridge in the Production account.
-
-You can do this in CloudShell, terminal, or wherever AWS CLI is configured for the Production account.
-
-Paste this into a file named event.json:
-
-~~~json
-[
-  {
-    "Source": "custom.mlops.retrain",
-    "DetailType": "StartRetrain",
-    "Detail": "{\"model_package_group_name\":\"credit-risk-model\",\"training_job_name\":\"prod-retrain-credit-risk-001\",\"training_image\":\"123456789012.dkr.ecr.us-east-1.amazonaws.com/my-train:latest\",\"inference_image\":\"123456789012.dkr.ecr.us-east-1.amazonaws.com/my-infer:latest\",\"role_arn\":\"arn:aws:iam::999999999999:role/SageMakerTrainingExecutionRole\",\"input_s3_uri\":\"s3://prod-ml-data/credit-risk/train/\",\"output_s3_uri\":\"s3://prod-ml-artifacts/credit-risk/retrain/\",\"instance_type\":\"ml.m5.xlarge\",\"approval_status\":\"Approved\",\"base_model_package_arn\":\"arn:aws:sagemaker:us-east-1:111111111111:model-package/credit-risk-model/5\",\"changed_feature_reason\":\"Updated production lookup column\"}"
-  }
-]
-~~~
-
-Then run:
-
-~~~bash
-aws events put-events --entries file://event.json
-~~~
-
-That should trigger Rule #1, which triggers Lambda #1, which starts the SageMaker training job.
-
----
-
-STEP 10: VERIFY LAMBDA #1 WORKED
-
-Go to:
-
-CloudWatch → Log groups → /aws/lambda/start-retraining-lambda
-
-Look for:
-- no exceptions
-- a returned training job ARN/name
-
-Then go to:
-
-SageMaker → Training jobs
-
-You should see:
-
-prod-retrain-credit-risk-001
-
-in progress or completed.
-
----
-
-STEP 11: WAIT FOR TRAINING TO COMPLETE
-
-Once the training job finishes, SageMaker sends the completion event automatically to EventBridge. EventBridge then triggers Lambda #2.
-
-You do not manually run Lambda #2.
-
----
-
-STEP 12: VERIFY LAMBDA #2 WORKED
-
-Go to:
-
-CloudWatch → Log groups → /aws/lambda/register-model-version-lambda
-
-You want to see:
-- no exceptions
-- a returned newModelPackageArn
-- the productionArtifactUri
-
-Then switch to the Control Plane account and go to:
-
-SageMaker → Model registry → your model package group
-
-Open your model package group, for example:
-
-credit-risk-model
-
-You should see:
-- a new version added
-- that version’s model data points to the Production S3 artifact
-- its approval status set to Approved if that is what you passed
-- older approved versions switched to Rejected by the Lambda, if any existed
-
-Creating a new version inside the model group is the expected SageMaker registry behavior, and approval changes are done by updating the model package version rather than the whole group.
-
----
-
-WHAT VALUES YOU NEED TO REPLACE BEFORE TESTING
-
-There are a few placeholders you must replace in the event payload:
-
-Replace these with real values:
-
-- credit-risk-model → your real Control Plane model package group name
-- 123456789012.dkr.ecr.us-east-1.amazonaws.com/my-train:latest → your real training image
-- 123456789012.dkr.ecr.us-east-1.amazonaws.com/my-infer:latest → your real inference image
-- arn:aws:iam::999999999999:role/SageMakerTrainingExecutionRole → your real SageMaker training role in Production
-- s3://prod-ml-data/credit-risk/train/ → your real training input path
-- s3://prod-ml-artifacts/credit-risk/retrain/ → your real output path
-- arn:aws:sagemaker:us-east-1:111111111111:model-package/credit-risk-model/5 → the original or baseline model package ARN you want to link back to
-- CONTROL_PLANE_ROLE_ARN environment variable → your real Control Plane registration role
-
----
-
-EASIEST WAY TO TEST WITHOUT REAL TRAINING LOGIC
-
-If your real training container is not ready yet, you have two easy choices:
-
-1. use an already working training image you know can finish successfully
-2. temporarily swap the training flow to a very simple built-in or known-good container just to prove the event chain works
-
-That way you’re testing the orchestration first:
-- EventBridge
-- Lambda
-- training completion event
-- model version registration
-
-and not getting stuck on model code bugs.
-
----
-
-WHAT “DEPRECATING” OLD VERSIONS MEANS HERE
-
-In your current code, “deprecating” is implemented as:
-
-- newest version gets Approved
-- all older Approved versions get changed to Rejected
-
-That does not delete the old versions. It just makes your newest one the only approved candidate, which is the normal governance pattern in SageMaker Model Registry.
-
----
-
-THE ONE ARCHITECTURAL CAVEAT
-
-Since your new Control Plane model version points to Production S3, any downstream deployment that uses that version must be able to read the Production artifact.
-
-For this exact tutorial, though, both EventBridge rules are in Production, and only the model registration crosses accounts through sts:AssumeRole, which is the simpler way to start.
-
----
-
-IF SOMETHING FAILS, CHECK IN THIS ORDER
-
-1. Did the custom event get sent?
-   Check the output of aws events put-events.
-
-2. Did Rule #1 fire?
-   Check start-retraining-lambda CloudWatch logs.
-
-3. Was the SageMaker training job created?
-   Check SageMaker Training Jobs page.
-
-4. Did the training job complete?
-   If not, fix the training image/input/output issue first.
-
-5. Did Rule #2 fire?
-   Check register-model-version-lambda CloudWatch logs.
-
-6. Did Lambda #2 assume the Control Plane role and create the model package version?
-   If not, the failing step will usually show clearly in the logs.
-
----
-
-SIMPLEST MENTAL MODEL
-
-Think of it like this:
-
-- Event 1 says: “start retraining”
-- Lambda 1 starts SageMaker retraining
-- SageMaker says: “training is done”
-- Lambda 2 says: “great, now register this as the new version in Control Plane”
-
-That is the whole loop.
-
-If you want, next I can give you the same tutorial but in Terraform file-by-file form, so you can deploy the two Lambdas and two EventBridge rules without clicking around in the console.
-
-Sent from my iPhone
