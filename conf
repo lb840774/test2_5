@@ -1,20 +1,277 @@
-Users enter the Databricks workspace.
-Data engineers, analysts, or applications access the Databricks workspace through the web app, notebooks, jobs, queries, or APIs. In Databricks terms, the workspace is the unified environment for a defined set of users.  
-The Databricks control plane receives and manages the request.
-The control plane handles the web application, APIs, job orchestration, authentication, and compute orchestration. It is Databricks-managed and lives in the Databricks account, not the customer cloud account.  
-The control plane decides what compute to use.
-For a given workload, Databricks uses either classic compute or serverless compute. Databricks supports both compute types in the workspace experience: classic compute for customizable resources and serverless compute for on-demand managed scaling.  
-If classic compute is used, Databricks provisions or manages compute in the customer AWS account.
-In your diagram, that is the SF Databricks Data Plane PROD (Customer AWS) area. Classic compute resources run in the customer cloud account and connect back to the control plane. This is also where customer-side resources like the workspace storage bucket belong for classic workspaces.  
-If serverless compute is used, Databricks runs the workload in the Databricks-managed serverless compute plane.
-This is why your diagram shows serverless tied back to the control plane. The serverless compute plane is separate from the control plane, but both live in the Databricks-managed environment, and connectivity between them is over the cloud backbone rather than the public internet.  
-The workload runs under Unity Catalog governance.
-Whether the workload uses classic or serverless compute, access is governed through Unity Catalog. In your diagram, that is the PROD-SF-EDL--Catalog plus the R/O catalog bindings for other approved domains. Workspaces are enabled for Unity Catalog by being assigned to a metastore.  
-The primary SF catalog governs how data is reached.
-In your diagram, the SF catalog exposes governed access paths such as S3 External Location and Redshift Foreign Catalog. That means the workspace is not bypassing governance; it is reaching storage and external data sources through approved catalog objects and bindings.  
-Compute accesses the underlying portfolio data sources.
-The actual data processing happens in compute, not in the control plane. From there, workloads reach portfolio data sources such as S3, Glue, and Redshift through governed access paths, including your JDBC/governed access line. Databricks’ architecture explicitly places data processing in the compute plane.  
-Results are returned to the workspace experience.
-Once the job, notebook, or query completes, users see the outputs back in the workspace through notebooks, dashboards, jobs, or query results. The workspace remains the user-facing environment, while the control plane continues to manage orchestration and governance in the background.  
-The same pattern repeats across environments.
-Your Production, Acceptance, Test, and Development layers all follow the same core model: workspace access, control-plane orchestration, governed compute, Unity Catalog enforcement, and access to approved data sources. That matches Databricks’ multi-workspace, multi-environment model.  
+1. Customer Data Plane (AWS Account)
+
+
+
+
+
+Databricks compute resources (clusters) are deployed within the customer-managed AWS VPC.
+
+
+
+Clusters run in private subnets (Connected Local Subnets) across multiple availability zones.
+These clusters process data but do not have direct internet exposure.
+All outbound communication is routed through controlled network paths.
+
+
+
+
+👉 This ensures:
+
+
+
+Data remains in the customer account
+Full control over networking and security boundaries
+
+
+
+
+
+
+
+
+
+
+🔐 2. Private Connectivity via VPC Endpoints (PrivateLink)
+
+
+
+
+
+Clusters communicate with both AWS services and Databricks control plane using VPC endpoints (PrivateLink).
+
+
+
+
+
+Two types of endpoints are used:
+
+
+
+
+
+
+
+a. AWS Service Endpoints
+
+
+
+
+
+Provide private access to:
+
+
+
+Amazon S3 (data storage)
+AWS Glue (metadata/catalog integration)
+Kinesis and other services
+
+
+
+
+
+
+b. Databricks Control Plane Endpoints
+
+
+
+
+
+Provide private communication to:
+
+
+
+Databricks REST APIs
+Secure Cluster Connectivity (SCC)
+
+
+
+
+👉 This means:
+
+
+
+No traffic traverses the public internet
+All communication stays within AWS private networking
+
+
+
+
+
+
+
+
+
+
+🔄 3. Secure Cluster Connectivity (SCC)
+
+
+
+
+
+Clusters establish outbound-only secure connections to the Databricks control plane.
+
+
+
+No inbound access to clusters is required
+Control plane interactions (job execution, commands, monitoring) occur through this secure channel
+
+
+
+
+👉 This enforces a zero inbound access model for compute resources
+
+
+
+
+
+
+
+
+
+🧠 4. Databricks Control Plane (Databricks Account)
+
+
+
+
+
+The control plane is fully managed by Databricks and operates outside the customer account.
+
+
+
+It is responsible for:
+
+
+
+Workspace UI and APIs
+Job orchestration and scheduling
+Cluster lifecycle management (create, scale, terminate)
+Unity Catalog governance (permissions, lineage, access control)
+
+
+
+
+Communication between data plane and control plane occurs via private VPC endpoints.
+
+
+
+
+
+
+
+
+
+🔑 5. Cross-Account IAM Access
+
+
+
+
+
+Databricks uses cross-account IAM roles to securely interact with customer resources.
+
+
+
+
+
+Roles include:
+
+
+
+
+
+Cluster provisioning role
+→ Allows Databricks to create and manage compute resources
+Catalog access role
+→ Enables access to governed data in S3 and external locations
+
+
+
+
+👉 Access is:
+
+
+
+Temporary (via STS assume role)
+Controlled by least privilege policies
+
+
+
+
+
+
+
+
+
+
+🗄️ 6. Data Access and Storage
+
+
+
+
+
+Data remains fully within the customer AWS account:
+
+
+
+Workspace Root S3 Bucket
+→ Stores logs, artifacts, and workspace-level data
+External Locations (Unity Catalog)
+→ Governed access to enterprise datasets
+
+
+
+
+👉 All data access is:
+
+
+
+Governed through Unity Catalog
+Enforced via IAM roles and policies
+
+
+
+
+
+
+
+
+
+
+🛡️ 7. Network Security Controls
+
+
+
+
+
+Additional security mechanisms include:
+
+
+
+Restrictive VPC Endpoint Policies
+→ Limit which services and endpoints can be accessed
+Private subnets only
+→ No direct internet routing
+Separation of control and data planes
+→ Reduces blast radius and enforces isolation
+
+
+
+
+
+
+
+
+
+
+👤 8. Identity and Access Integration
+
+
+
+
+
+User authentication and authorization are handled via enterprise identity systems:
+
+
+
+Databricks integrates with Ping Identity → Active Directory
+Users, groups, and service principals are synchronized into the workspace
+Access to data is enforced via Unity Catalog ACLs
