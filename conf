@@ -1,109 +1,20 @@
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 1) USER / CLIENT APP                                                       │
-│    - Browser / mobile app / Postman / another service                      │
-└──────────────────────────────┬──────────────────────────────────────────────┘
-                               │
-                               │ (A) User signs in
-                               ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 2) EXTERNAL IDP                                                            │
-│    - Auth0 / Okta / Entra / Cognito                                        │
-│    - Issues EXTERNAL OAuth/JWT token                                       │
-└──────────────────────────────┬──────────────────────────────────────────────┘
-                               │
-                               │ (B) User calls Runtime with bearer token
-                               ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 3) AGENTCORE RUNTIME                                                       │
-│                                                                             │
-│   3a. RUNTIME INBOUND AUTH                                                  │
-│       [AGENTCORE IDENTITY EXERCISED]                                        │
-│       - Validates inbound JWT                                               │
-│       - Confirms caller can access Runtime                                  │
-│                                                                             │
-│   3b. TOKEN EXCHANGE / INTERNAL TRUST SETUP                                 │
-│       [AGENTCORE IDENTITY EXERCISED]                                        │
-│       - Extracts USER identity from JWT                                     │
-│       - Looks up RUNTIME WORKLOAD identity                                  │
-│       - BINDS them together:                                                │
-│           "This Runtime workload is acting on behalf of this user"          │
-│       - Obtains WORKLOAD ACCESS TOKEN                                       │
-│                                                                             │
-│       Binding result conceptually:                                          │
-│       {                                                                     │
-│         user: "Lakshmi",                                                    │
-│         workload: "Runtime-Agent-123",                                      │
-│         permissions: [allowed tools/providers]                              │
-│       }                                                                     │
-│                                                                             │
-│       IMPORTANT:                                                            │
-│       - Workload Access Token is NOT the backend API token                  │
-│       - It is for first-party AgentCore services only                       │
-│       - Runtime automatically receives it during execution                  │
-│                                                                             │
-│   3c. AGENT EXECUTION                                                       │
-│       - Runs agent logic / orchestration                                    │
-│       - Decides a tool is needed                                            │
-└──────────────────────────────┬──────────────────────────────────────────────┘
-                               │
-                               │ (C) Runtime code calls Gateway MCP endpoint
-                               │
-                               │ IMPORTANT:
-                               │ - Your code chooses WHERE to call
-                               │ - This call IMPLICITLY carries forward the
-                               │   already-bound AgentCore context from 3b
-                               │ - The MCP URL is the destination only;
-                               │   AgentCore handles context propagation
-                               ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 4) AGENTCORE GATEWAY                                                       │
-│                                                                             │
-│   4a. GATEWAY INBOUND AUTH                                                  │
-│       [AGENTCORE IDENTITY EXERCISED]                                        │
-│       - Validates whoever is calling the Gateway                            │
-│       - Protects Gateway as its own entry point                             │
-│                                                                             │
-│   4b. TOOL FACADE / MCP ENDPOINT                                            │
-│       - Exposes tools through MCP                                           │
-│       - Supports tools/list and tools/call                                  │
-│                                                                             │
-│   4c. GATEWAY OUTBOUND AUTH REQUEST                                         │
-│       [AGENTCORE IDENTITY EXERCISED]                                        │
-│       - Gateway uses the propagated internal AgentCore context              │
-│       - Workload access token is applied automatically behind the scenes     │
-│       - Identity uses that token/context to understand:                     │
-│           • which workload is asking                                        │
-│           • which user it is acting for                                     │
-│           • what permissions apply                                          │
-│                                                                             │
-│       Example decision:                                                     │
-│       "Can Runtime-Agent-123, acting for Lakshmi, use LoanAPI provider?"    │
-│                                                                             │
-│       - If allowed, Identity authorizes access to credentials               │
-└──────────────────────────────┬──────────────────────────────────────────────┘
-                               │
-                               │ (D) If OAuth is needed, Identity uses the
-                               │     configured credential provider / token
-                               │     endpoint flow to get the REAL backend
-                               │     API token
-                               ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 5) DOWNSTREAM AUTH SERVER / TOKEN ENDPOINT                                 │
-│    - Returns ACTUAL OAuth access token for backend API                      │
-│    - Different from the Workload Access Token                               │
-└──────────────────────────────┬──────────────────────────────────────────────┘
-                               │
-                               │ (E) Real API token returned to Gateway
-                               ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 6) BACKEND TARGET                                                          │
-│    - API / Lambda / SaaS / AWS service / MCP server                         │
-│    - Gateway calls target using the REAL outbound credentials               │
-└──────────────────────────────┬──────────────────────────────────────────────┘
-                               │
-                               │ (F) Response
-                               ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 7) RESPONSE PATH                                                           │
-│    Backend Target → Gateway → Runtime → User                                │
-└─────────────────────────────────────────────────────────────────────────────┘
+Users enter the Databricks workspace.
+Data engineers, analysts, or applications access the Databricks workspace through the web app, notebooks, jobs, queries, or APIs. In Databricks terms, the workspace is the unified environment for a defined set of users.  
+The Databricks control plane receives and manages the request.
+The control plane handles the web application, APIs, job orchestration, authentication, and compute orchestration. It is Databricks-managed and lives in the Databricks account, not the customer cloud account.  
+The control plane decides what compute to use.
+For a given workload, Databricks uses either classic compute or serverless compute. Databricks supports both compute types in the workspace experience: classic compute for customizable resources and serverless compute for on-demand managed scaling.  
+If classic compute is used, Databricks provisions or manages compute in the customer AWS account.
+In your diagram, that is the SF Databricks Data Plane PROD (Customer AWS) area. Classic compute resources run in the customer cloud account and connect back to the control plane. This is also where customer-side resources like the workspace storage bucket belong for classic workspaces.  
+If serverless compute is used, Databricks runs the workload in the Databricks-managed serverless compute plane.
+This is why your diagram shows serverless tied back to the control plane. The serverless compute plane is separate from the control plane, but both live in the Databricks-managed environment, and connectivity between them is over the cloud backbone rather than the public internet.  
+The workload runs under Unity Catalog governance.
+Whether the workload uses classic or serverless compute, access is governed through Unity Catalog. In your diagram, that is the PROD-SF-EDL--Catalog plus the R/O catalog bindings for other approved domains. Workspaces are enabled for Unity Catalog by being assigned to a metastore.  
+The primary SF catalog governs how data is reached.
+In your diagram, the SF catalog exposes governed access paths such as S3 External Location and Redshift Foreign Catalog. That means the workspace is not bypassing governance; it is reaching storage and external data sources through approved catalog objects and bindings.  
+Compute accesses the underlying portfolio data sources.
+The actual data processing happens in compute, not in the control plane. From there, workloads reach portfolio data sources such as S3, Glue, and Redshift through governed access paths, including your JDBC/governed access line. Databricks’ architecture explicitly places data processing in the compute plane.  
+Results are returned to the workspace experience.
+Once the job, notebook, or query completes, users see the outputs back in the workspace through notebooks, dashboards, jobs, or query results. The workspace remains the user-facing environment, while the control plane continues to manage orchestration and governance in the background.  
+The same pattern repeats across environments.
+Your Production, Acceptance, Test, and Development layers all follow the same core model: workspace access, control-plane orchestration, governed compute, Unity Catalog enforcement, and access to approved data sources. That matches Databricks’ multi-workspace, multi-environment model.  
